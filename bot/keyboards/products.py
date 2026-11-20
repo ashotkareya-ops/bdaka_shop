@@ -20,6 +20,7 @@ def products_keyboard(products):
             callback_data=f"product:{product.id}",
         )
     kb.button(text="⬅️ К разделам", callback_data="back:catalog")
+    kb.button(text="🏠 Вернуться в главное меню", callback_data="menu:home")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -28,7 +29,7 @@ def buy_keyboard(product_id):
     kb = InlineKeyboardBuilder()
     kb.button(text="🛒 Купить", callback_data=f"buy:{product_id}")
     kb.button(text="⬅️ К товарам", callback_data="back:products")
-    kb.button(text="🏠 В каталог", callback_data="back:catalog")
+    kb.button(text="🏠 Вернуться в главное меню", callback_data="menu:home")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -37,6 +38,6 @@ def unavailable_keyboard():
     kb = InlineKeyboardBuilder()
     kb.button(text="🔔 Сейчас нет в наличии", callback_data="stock:unavailable")
     kb.button(text="⬅️ К товарам", callback_data="back:products")
-    kb.button(text="🏠 В каталог", callback_data="back:catalog")
+    kb.button(text="🏠 Вернуться в главное меню", callback_data="menu:home")
     kb.adjust(1)
     return kb.as_markup()

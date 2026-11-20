@@ -1,9 +1,9 @@
 from aiogram import Router, F
 from aiogram.types import CallbackQuery
 from bot.keyboards.products import buy_keyboard, unavailable_keyboard
+from bot.utils.section_media import send_section, product_banner
 
 router = Router()
-
 
 @router.callback_query(F.data.startswith("product:"))
 async def product_details(callback: CallbackQuery, session):
@@ -55,5 +55,5 @@ async def product_details(callback: CallbackQuery, session):
         "🏷 <i>BDAKA SHOP</i>"
     )
     markup = buy_keyboard(product.id) if can_buy else unavailable_keyboard()
-    await callback.message.edit_text(text, reply_markup=markup)
+    await send_section(callback.message, product_banner(product), text, reply_markup=markup)
     await callback.answer()

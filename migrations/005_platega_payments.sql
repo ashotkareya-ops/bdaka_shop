@@ -1,0 +1,8 @@
+ALTER TABLE payments
+    ADD COLUMN IF NOT EXISTS order_id INTEGER NULL REFERENCES orders(id),
+    ADD COLUMN IF NOT EXISTS payment_url TEXT NULL,
+    ADD COLUMN IF NOT EXISTS payload VARCHAR(200) NULL,
+    ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMP NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_payments_order_id
+    ON payments(order_id) WHERE order_id IS NOT NULL;

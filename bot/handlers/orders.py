@@ -11,13 +11,44 @@ from database.models.transaction import Transaction
 from config.constants import OrderStatus
 from config.settings import settings
 from suppliers.sandromania.client import SandromaniaClient, SandromaniaAPIError
+from bot.keyboards.payments import payment_method_keyboard, invoice_keyboard
+from database.models.payment import Payment
+from payments.providers.platega import PlategaClient, PlategaError
 
 router = Router()
 log = logging.getLogger(__name__)
 
 @router.callback_query(F.data.startswith("buy:"))
 async def buy_product(callback: CallbackQuery, session):
-    product_id = int(callback.data.split(":")[1])
+    parts = callback.data.split(":")
+    if len(parts) == 2:
+        try:
+            product_id = int(parts[1])
+        except ValueError:
+            await callback.answer("Некорректный товар", show_alert=True)
+            return
+        product = await session.get(Product, product_id)
+        if not product or not product.is_active:
+            await callback.answer("Товар недоступен", show_alert=True)
+            return
+        await callback.message.edit_reply_markup(reply_markup=payment_method_keyboard(product_id))
+        await callback.answer()
+        return
+    if len(parts) != 3:
+        await callback.answer("Некорректный запрос", show_alert=True)
+        return
+    method, raw_product_id = parts[1], parts[2]
+    try:
+        product_id = int(raw_product_id)
+    except ValueError:
+        await callback.answer("Некорректный товар", show_alert=True)
+        return
+    if method == "platega":
+        await create_platega_order(callback, session, product_id)
+        return
+    if method != "balance":
+        await callback.answer("Неизвестный способ оплаты", show_alert=True)
+        return
     user = await session.scalar(
         select(User).where(User.telegram_id == callback.from_user.id).with_for_update()
     )
@@ -128,3 +159,123 @@ async def buy_product(callback: CallbackQuery, session):
             "чтобы не допустить двойной покупки. Поддержка проверит статус у поставщика."
         )
         await callback.answer("Заказ требует проверки", show_alert=True)
+
+
+async def create_platega_order(callback: CallbackQuery, session, product_id: int):
+    user = await session.scalar(
+        select(User).where(User.telegram_id == callback.from_user.id).with_for_update()
+    )
+    product = await session.get(Product, product_id)
+    if not user or not product or not product.is_active or product.price <= 0:
+        await callback.answer("Не удалось оформить заказ", show_alert=True)
+        return
+
+    key = await session.scalar(
+        select(DigitalKey).where(
+            DigitalKey.product_id == product.id, DigitalKey.status == "AVAILABLE"
+        ).with_for_update(skip_locked=True).limit(1)
+    )
+    use_supplier = key is None and product.supplier_name == "sandromania" and product.supplier_product_id
+    if key is None and not use_supplier:
+        await callback.answer("Товар временно отсутствует", show_alert=True)
+        return
+    if use_supplier:
+        if not settings.sandromania_enabled:
+            await callback.answer("Интеграция поставщика не настроена", show_alert=True)
+            return
+        try:
+            from services.supplier_sync import refresh_supplier_product_stock
+            live_item = await refresh_supplier_product_stock(session, product)
+        except Exception:
+            log.exception("Supplier stock check failed for product_id=%s", product.id)
+            await callback.answer("Не удалось проверить наличие. Попробуйте позже.", show_alert=True)
+            return
+        if live_item is None or not product.supplier_available or not product.supplier_stock or product.supplier_stock <= 0:
+            await callback.answer("Товар закончился у поставщика", show_alert=True)
+            return
+
+    if not settings.platega_enabled:
+        await callback.answer("Оплата Platega пока не настроена", show_alert=True)
+        return
+
+    order = Order(
+        user_id=user.id, product_id=product.id, price=product.price,
+        status=OrderStatus.PENDING.value,
+        idempotency_key=secrets.token_urlsafe(24) if use_supplier else None,
+    )
+    session.add(order)
+    await session.flush()
+    payment = Payment(
+        user_id=user.id, order_id=order.id, amount=product.price,
+        provider="platega", status="CREATING", payload=f"order-{order.id}",
+    )
+    session.add(payment)
+    await session.commit()
+
+    try:
+        invoice = await PlategaClient().create_invoice(
+            amount=product.price, currency=settings.currency,
+            payload=f"order-{order.id}", description=f"BDAKA SHOP — заказ #{order.id}",
+        )
+        payment.external_id = invoice["external_id"]
+        payment.payment_url = invoice["url"]
+        payment.status = "PENDING"
+        await session.commit()
+    except Exception:
+        log.exception("Could not create Platega invoice for order_id=%s", order.id)
+        order.status = OrderStatus.FAILED.value
+        payment.status = "FAILED"
+        await session.commit()
+        await callback.message.answer("Не удалось создать платёж. Деньги не списаны. Попробуйте позже.")
+        await callback.answer("Ошибка создания платежа", show_alert=True)
+        return
+
+    await callback.message.answer(
+        f"🧾 <b>Заказ #{order.id} создан</b>\n"
+        f"Товар: {product.name}\n"
+        f"К оплате: <b>{product.price:.2f} ₽</b>\n\n"
+        "После оплаты вернитесь в бот. Товар будет выдан после подтверждения Platega.",
+        reply_markup=invoice_keyboard(invoice["url"], order.id),
+    )
+    await callback.answer("Счёт создан")
+
+
+@router.callback_query(F.data.startswith("payment:check:"))
+async def check_payment(callback: CallbackQuery, session):
+    try:
+        order_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный заказ", show_alert=True)
+        return
+    payment = await session.scalar(
+        select(Payment).join(Order, Payment.order_id == Order.id)
+        .where(Order.id == order_id, Order.user_id == select(User.id).where(User.telegram_id == callback.from_user.id).scalar_subquery())
+    )
+    if not payment or payment.provider != "platega":
+        await callback.answer("Платёж не найден", show_alert=True)
+        return
+    if payment.status == "CONFIRMED":
+        await callback.answer("Оплата подтверждена. Если товар ещё не пришёл, заказ обрабатывается.", show_alert=True)
+        return
+    if not payment.external_id:
+        await callback.answer("Платёж ещё создаётся", show_alert=True)
+        return
+    try:
+        state = await PlategaClient().get_transaction(payment.external_id)
+        status = str(state.get("status", "")).upper()
+        if status == "CONFIRMED":
+            details = state.get("paymentDetails") or {}
+            from services.payment_service import process_platega_callback
+            await process_platega_callback({
+                "id": payment.external_id,
+                "amount": details.get("amount", state.get("amount")),
+                "currency": details.get("currency", state.get("currency")),
+                "status": "CONFIRMED",
+                "payload": state.get("payload") or payment.payload,
+            }, callback.bot)
+            await callback.answer("Оплата подтверждена. Выдача товара запущена.", show_alert=True)
+        else:
+            await callback.answer(f"Статус платежа: {status or 'неизвестен'}", show_alert=True)
+    except Exception:
+        log.exception("Payment status check failed: order_id=%s", order_id)
+        await callback.answer("Не удалось проверить статус. Попробуйте позже.", show_alert=True)

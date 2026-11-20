@@ -1,11 +1,25 @@
 from aiogram import Router
-from aiogram.filters import CommandStart
-from aiogram.types import Message
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove
 from sqlalchemy import select
 from database.models.user import User
+from bot.utils.section_media import send_section
 from bot.keyboards.main import main_menu
 
 router = Router()
+
+async def show_main_menu(target, user_name: str = "покупатель"):
+    # Remove the old persistent reply keyboard first; the real navigation is
+    # an inline keyboard attached directly to the BDAKA Shop welcome photo.
+    await target.answer("\u2060", reply_markup=ReplyKeyboardRemove())
+    text = (
+        f"👋 Добро пожаловать в <b>BDAKA SHOP</b>, {user_name}!\n\n"
+        "Используйте меню команд Telegram (значок /), чтобы открыть каталог, профиль и другие разделы."
+    )
+    await send_section(
+        target, "home.png", text,
+        reply_markup=main_menu(),
+    )
 
 @router.message(CommandStart())
 async def start(message: Message, session):
@@ -27,11 +41,26 @@ async def start(message: Message, session):
             username=message.from_user.username,
             full_name=message.from_user.full_name,
             balance=0,
-            referrer_id=referrer_id
+            referrer_id=referrer_id,
         )
         session.add(user)
         await session.commit()
+    await show_main_menu(message, message.from_user.first_name)
+
+@router.message(Command("help"))
+async def buyer_help(message: Message):
     await message.answer(
-        f"👋 Добро пожаловать в <b>BDAKA SHOP</b>, {message.from_user.first_name}!\n\nВыберите раздел в меню.",
-        reply_markup=main_menu()
+        "<b>Команды покупателя</b>\n"
+        "/start — главное меню\n"
+        "/catalog — каталог товаров\n"
+        "/profile — профиль и баланс\n"
+        "/balance — пополнение баланса\n"
+        "/purchases — мои покупки\n"
+        "/transactions — история операций\n"
+        "/links — полезные ссылки"
     )
+
+@router.callback_query(lambda c: c.data == "menu:home")
+async def menu_home(callback: CallbackQuery):
+    await show_main_menu(callback.message, callback.from_user.first_name)
+    await callback.answer()
