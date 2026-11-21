@@ -17,6 +17,9 @@ BUYER_COMMANDS = [
 
 ADMIN_COMMANDS = BUYER_COMMANDS + [
     BotCommand(command="admin", description="Панель администратора"),
+    BotCommand(command="adminhelp", description="Все команды администратора"),
+    BotCommand(command="categories", description="Управление категориями"),
+    BotCommand(command="deletecategory", description="Удалить пустую категорию"),
     BotCommand(command="products", description="Список товаров и их ID"),
     BotCommand(command="addcategory", description="Создать категорию"),
     BotCommand(command="addproduct", description="Добавить товар"),

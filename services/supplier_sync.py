@@ -157,7 +157,10 @@ async def sync_sandromania_catalog(session: AsyncSession) -> dict:
         else:
             product.category_id = category.id
             product.name = item["name"]
-            product.description = item["description"]
+            # Keep the description once populated: admins can customize it and
+            # routine supplier sync must not overwrite their shop copy.
+            if not (product.description or "").strip():
+                product.description = item["description"]
             product.supplier_cost = item["supplier_cost"]
             if item["supplier_cost"] is not None:
                 product.price = round(item["supplier_cost"] * (1 + (product.markup_percent or 30.0) / 100), 2)

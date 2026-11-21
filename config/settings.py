@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     database_url: str = Field(alias="DATABASE_URL")
     redis_url: str = "redis://localhost:6379/0"
     currency: str = "RUB"
+    shop_reviews_url: str = "https://t.me/bdaka_reviews"
+    shop_news_url: str = "https://t.me/bdaka_store"
+    shop_chat_url: str = "https://t.me/+jBNfIlXR13RhNmUy"
+    shop_support_url: str = "https://t.me/bdaka1"
 
     sandromania_base_url: str = "https://api.sandromania.shop"
     sandromania_api_key: str = ""

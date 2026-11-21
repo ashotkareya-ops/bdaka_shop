@@ -72,11 +72,7 @@ async def category_products(callback: CallbackQuery, session):
     if not products:
         await callback.answer("В этом разделе пока нет товаров", show_alert=True)
         return
-    text = (
-        f"📁 <b>{category.name}</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "Выберите товар. Остаток указан по последним данным поставщика."
-    )
+    text = "Выберите товар. Остаток указан по последним данным поставщика."
     await send_section(callback.message, product_banner(products[0]), text,
                        reply_markup=products_keyboard(products))
     await callback.answer()

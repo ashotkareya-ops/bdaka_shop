@@ -11,6 +11,8 @@ from database.models.user import User
 from config.constants import OrderStatus
 from config.settings import settings
 from suppliers.sandromania.client import SandromaniaClient
+from services.order_delivery import send_order_delivery
+from services.review_publisher import publish_purchase_notice
 
 log = logging.getLogger(__name__)
 
@@ -122,9 +124,8 @@ async def fulfill_paid_order(order_id: int, bot):
             order.status = OrderStatus.COMPLETED.value
             user.purchase_count += 1
             await session.commit()
-            await bot.send_message(user.telegram_id,
-                f"✅ <b>Оплата получена!</b>\nЗаказ #{order.id}\nТовар: {product.name}\n"
-                f"Ваш CDK:\n<code>{key.code}</code>\n\nСохраните код.")
+            await send_order_delivery(bot, order.id)
+            await publish_purchase_notice(bot, order.id)
             return
 
         if product.supplier_name != "sandromania" or not product.supplier_product_id:
@@ -156,17 +157,17 @@ async def fulfill_paid_order(order_id: int, bot):
         if not order or order.status != OrderStatus.PROCESSING.value:
             return
         order.supplier_order_id = result.get("order_id")
-        if result.get("code"):
+        delivery = result.get("delivery") or result.get("code")
+        if delivery:
             session.add(DigitalKey(product_id=order.product_id, order_id=order.id,
-                                   code=result["code"], status="SOLD"))
+                                   code=delivery, status="SOLD"))
             order.status = OrderStatus.COMPLETED.value
             user = await session.get(User, order.user_id)
             if user:
                 user.purchase_count += 1
             await session.commit()
-            await bot.send_message(telegram_id,
-                f"✅ <b>Оплата получена!</b>\nЗаказ #{order_id}\nТовар: {product_name}\n"
-                f"Ваш CDK:\n<code>{result['code']}</code>")
+            await send_order_delivery(bot, order_id)
+            await publish_purchase_notice(bot, order_id)
         else:
             await session.commit()
             await bot.send_message(telegram_id,

@@ -1,7 +1,7 @@
 import secrets
 import logging
 from aiogram import Router, F
-from aiogram.types import CallbackQuery
+from aiogram.types import CallbackQuery, PreCheckoutQuery, LabeledPrice
 from sqlalchemy import select
 from database.models.user import User
 from database.models.product import Product
@@ -10,12 +10,23 @@ from database.models.digital_key import DigitalKey
 from database.models.transaction import Transaction
 from config.constants import OrderStatus
 from config.settings import settings
+from services.order_delivery import send_order_delivery
+from services.review_publisher import publish_purchase_notice
 from suppliers.sandromania.client import SandromaniaClient, SandromaniaAPIError
 from bot.keyboards.payments import payment_method_keyboard, invoice_keyboard
+import math
+from datetime import datetime
 from database.models.payment import Payment
 from payments.providers.platega import PlategaClient, PlategaError
 
 router = Router()
+RUB_PER_STAR = 0.95
+
+
+def _stars_for_rubles(amount_rub: float) -> int:
+    return math.ceil(float(amount_rub) / RUB_PER_STAR)
+
+
 log = logging.getLogger(__name__)
 
 @router.callback_query(F.data.startswith("buy:"))
@@ -31,7 +42,24 @@ async def buy_product(callback: CallbackQuery, session):
         if not product or not product.is_active:
             await callback.answer("Товар недоступен", show_alert=True)
             return
-        await callback.message.edit_reply_markup(reply_markup=payment_method_keyboard(product_id))
+        # Replace the long product description with a compact checkout summary.
+        checkout_text = (
+            "🛒 <b>Расчёт заказа</b>\n"
+            f"Товар: <b>{product.name}</b>\n"
+            "🟢 Количество: 1\n"
+            f"💰 Товар: <b>{product.price:.2f} ₽</b>\n"
+            "<i>Выберите способ оплаты. </i>"
+        )
+        if callback.message.photo:
+            await callback.message.edit_caption(
+                caption=checkout_text,
+                reply_markup=payment_method_keyboard(product_id),
+            )
+        else:
+            await callback.message.edit_text(
+                checkout_text,
+                reply_markup=payment_method_keyboard(product_id),
+            )
         await callback.answer()
         return
     if len(parts) != 3:
@@ -43,12 +71,23 @@ async def buy_product(callback: CallbackQuery, session):
     except ValueError:
         await callback.answer("Некорректный товар", show_alert=True)
         return
+    if method == "stars":
+        await create_stars_order(callback, session, product_id)
+        return
     if method == "platega":
-        await create_platega_order(callback, session, product_id)
+        await callback.answer(
+            "Для цифровых товаров внутри Telegram доступна оплата только Telegram Stars.",
+            show_alert=True,
+        )
         return
-    if method != "balance":
-        await callback.answer("Неизвестный способ оплаты", show_alert=True)
+    if method == "balance":
+        await callback.answer(
+            "Оплата цифровых товаров внутри Telegram проводится через Telegram Stars.",
+            show_alert=True,
+        )
         return
+    await callback.answer("Неизвестный способ оплаты", show_alert=True)
+    return
     user = await session.scalar(
         select(User).where(User.telegram_id == callback.from_user.id).with_for_update()
     )
@@ -79,7 +118,7 @@ async def buy_product(callback: CallbackQuery, session):
         except Exception:
             log.exception("Could not refresh supplier stock for product_id=%s", product.id)
             await callback.answer(
-                "Не удалось проверить наличие у поставщика. Попробуйте немного позже.",
+                "Не удалось проверить наличие у продавца. Попробуйте немного позже.",
                 show_alert=True,
             )
             return
@@ -89,7 +128,7 @@ async def buy_product(callback: CallbackQuery, session):
             or product.supplier_stock is None
             or product.supplier_stock <= 0
         ):
-            await callback.answer("Товар закончился или поставщик не подтвердил остаток.", show_alert=True)
+            await callback.answer("Товар закончился.", show_alert=True)
             return
     if user.balance < product.price:
         await callback.answer("Недостаточно средств на балансе", show_alert=True)
@@ -109,12 +148,10 @@ async def buy_product(callback: CallbackQuery, session):
     if key:
         key.status = "SOLD"
         key.order = order
+        order.status = OrderStatus.COMPLETED.value
         await session.commit()
-        await callback.message.answer(
-            f"✅ <b>Покупка успешно оформлена!</b>\n\n"
-            f"Товар: {product.name}\nВаш CDK:\n<code>{key.code}</code>\n\n"
-            "Сохраните код и следуйте инструкции поставщика."
-        )
+        await send_order_delivery(callback.bot, order.id)
+        await publish_purchase_notice(callback.bot, order.id)
         await callback.answer("Заказ выполнен")
         return
 
@@ -124,20 +161,18 @@ async def buy_product(callback: CallbackQuery, session):
             int(product.supplier_product_id), order.idempotency_key
         )
         order.supplier_order_id = result.get("order_id")
-        if result.get("code"):
+        delivery = result.get("delivery") or result.get("code")
+        if delivery:
             session.add(DigitalKey(
                 product_id=product.id, order_id=order.id,
-                code=result["code"], status="SOLD"
+                code=delivery, status="SOLD"
             ))
             order.status = OrderStatus.COMPLETED.value
             if product.supplier_stock is not None and product.supplier_stock > 0:
                 product.supplier_stock -= 1
             await session.commit()
-            await callback.message.answer(
-                f"✅ <b>Покупка успешно оформлена!</b>\n\n"
-                f"Товар: {product.name}\nВаш CDK:\n<code>{result['code']}</code>\n\n"
-                "Сохраните код и следуйте инструкции поставщика."
-            )
+            await send_order_delivery(callback.bot, order.id)
+            await publish_purchase_notice(callback.bot, order.id)
         else:
             order.status = OrderStatus.PROCESSING.value
             await session.commit()
@@ -156,9 +191,164 @@ async def buy_product(callback: CallbackQuery, session):
         await callback.message.answer(
             f"⏳ Не удалось однозначно получить результат закупки. "
             f"Заказ #{order.id} сохранён для проверки; средства пока удерживаются, "
-            "чтобы не допустить двойной покупки. Поддержка проверит статус у поставщика."
+            "чтобы не допустить двойной покупки. Поддержка проверит статус."
         )
         await callback.answer("Заказ требует проверки", show_alert=True)
+
+
+async def create_stars_order(callback: CallbackQuery, session, product_id: int):
+    """Create a Telegram Stars invoice for a digital product."""
+    user = await session.scalar(
+        select(User).where(User.telegram_id == callback.from_user.id).with_for_update()
+    )
+    product = await session.get(Product, product_id)
+    if not user or not product or not product.is_active or product.price <= 0:
+        await callback.answer("Не удалось оформить заказ", show_alert=True)
+        return
+
+    key = await session.scalar(
+        select(DigitalKey).where(
+            DigitalKey.product_id == product.id,
+            DigitalKey.status == "AVAILABLE",
+        ).with_for_update(skip_locked=True).limit(1)
+    )
+    use_supplier = (
+        key is None
+        and product.supplier_name == "sandromania"
+        and product.supplier_product_id
+    )
+    if key is None and not use_supplier:
+        await callback.answer("Товар временно отсутствует", show_alert=True)
+        return
+    if use_supplier:
+        if not settings.sandromania_enabled:
+            await callback.answer("Интеграция поставщика не настроена", show_alert=True)
+            return
+        try:
+            from services.supplier_sync import refresh_supplier_product_stock
+            live_item = await refresh_supplier_product_stock(session, product)
+        except Exception:
+            log.exception("Stars stock check failed for product_id=%s", product.id)
+            await callback.answer("Не удалось проверить наличие. Попробуйте позже.", show_alert=True)
+            return
+        if (
+            live_item is None or not product.supplier_available
+            or not product.supplier_stock or product.supplier_stock <= 0
+        ):
+            await callback.answer("Товар закончился.", show_alert=True)
+            return
+
+    stars = _stars_for_rubles(product.price)
+    order = Order(
+        user_id=user.id,
+        product_id=product.id,
+        price=product.price,
+        status=OrderStatus.PENDING.value,
+        idempotency_key=secrets.token_urlsafe(24) if use_supplier else None,
+    )
+    session.add(order)
+    await session.flush()
+    payment = Payment(
+        user_id=user.id,
+        order_id=order.id,
+        amount=float(product.price),
+        provider="telegram_stars",
+        status="PENDING",
+        payload=f"stars-order-{order.id}",
+    )
+    session.add(payment)
+    await session.commit()
+
+    try:
+        await callback.message.answer_invoice(
+            title=product.name[:32],
+            description=f"BDAKA SHOP — заказ #{order.id}",
+            payload=payment.payload,
+            currency="XTR",
+            prices=[LabeledPrice(label=product.name[:32], amount=stars)],
+        )
+    except Exception:
+        log.exception("Could not send Stars invoice for order_id=%s", order.id)
+        order.status = OrderStatus.FAILED.value
+        payment.status = "FAILED"
+        await session.commit()
+        await callback.answer("Не удалось создать счёт Telegram Stars", show_alert=True)
+        return
+
+    await callback.answer("Счёт Telegram Stars создан")
+
+
+@router.pre_checkout_query()
+async def validate_stars_order(query: PreCheckoutQuery, session):
+    payment = await session.scalar(
+        select(Payment).where(Payment.payload == query.invoice_payload).with_for_update()
+    )
+    if (
+        not payment
+        or payment.provider != "telegram_stars"
+        or payment.order_id is None
+        or payment.status != "PENDING"
+        or query.currency != "XTR"
+        or query.total_amount != _stars_for_rubles(payment.amount)
+    ):
+        await query.answer(ok=False, error_message="Счёт недействителен. Создайте новый.")
+        return
+    order = await session.get(Order, payment.order_id)
+    user = await session.get(User, payment.user_id)
+    if (
+        not order or order.status != OrderStatus.PENDING.value
+        or not user or user.telegram_id != query.from_user.id
+    ):
+        await query.answer(ok=False, error_message="Заказ недействителен или принадлежит другому пользователю.")
+        return
+    await query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def confirm_stars_order(message, session):
+    successful = message.successful_payment
+    payment = await session.scalar(
+        select(Payment)
+        .where(Payment.payload == successful.invoice_payload)
+        .with_for_update()
+    )
+    if (
+        not payment or payment.provider != "telegram_stars"
+        or payment.order_id is None or successful.currency != "XTR"
+        or successful.total_amount != _stars_for_rubles(payment.amount)
+    ):
+        log.error("Unmatched Telegram Stars order payment from user=%s", message.from_user.id)
+        await message.answer("Не удалось сопоставить оплату с заказом. Обратитесь в поддержку.")
+        return
+
+    order = await session.scalar(
+        select(Order).where(Order.id == payment.order_id).with_for_update()
+    )
+    user = await session.get(User, payment.user_id)
+    if not order or not user or user.telegram_id != message.from_user.id:
+        await message.answer("Не удалось подтвердить владельца заказа. Обратитесь в поддержку.")
+        return
+
+    charge_id = successful.telegram_payment_charge_id
+    if payment.status == "CONFIRMED":
+        await message.answer("Оплата этого заказа уже была обработана.")
+        return
+    if order.status != OrderStatus.PENDING.value:
+        await message.answer("Статус заказа изменился. Обратитесь в поддержку.")
+        return
+
+    payment.status = "CONFIRMED"
+    payment.external_id = charge_id
+    payment.confirmed_at = datetime.utcnow()
+    order.status = OrderStatus.PAID.value
+    await session.commit()
+
+    await message.answer(
+        f"✅ Оплата заказа <b>#{order.id}</b> подтверждена в Telegram Stars. "
+        "Начинаем подготовку товара."
+    )
+    from services.payment_service import fulfill_paid_order
+    await fulfill_paid_order(order.id, message.bot)
 
 
 async def create_platega_order(callback: CallbackQuery, session, product_id: int):
@@ -191,7 +381,7 @@ async def create_platega_order(callback: CallbackQuery, session, product_id: int
             await callback.answer("Не удалось проверить наличие. Попробуйте позже.", show_alert=True)
             return
         if live_item is None or not product.supplier_available or not product.supplier_stock or product.supplier_stock <= 0:
-            await callback.answer("Товар закончился у поставщика", show_alert=True)
+            await callback.answer("Товар закончился.", show_alert=True)
             return
 
     if not settings.platega_enabled:
@@ -231,9 +421,9 @@ async def create_platega_order(callback: CallbackQuery, session, product_id: int
         return
 
     await callback.message.answer(
-        f"🧾 <b>Заказ #{order.id} создан</b>\n"
-        f"Товар: {product.name}\n"
-        f"К оплате: <b>{product.price:.2f} ₽</b>\n\n"
+        f"🧾 <b>Заказ #{order.id} создан</b>"
+        f"Товар: {product.name}"
+        f"К оплате: <b>{product.price:.2f} ₽</b>"
         "После оплаты вернитесь в бот. Товар будет выдан после подтверждения Platega.",
         reply_markup=invoice_keyboard(invoice["url"], order.id),
     )

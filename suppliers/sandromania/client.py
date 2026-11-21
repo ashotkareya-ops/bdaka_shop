@@ -1,15 +1,98 @@
-import json
 import asyncio
-import uuid
+import json
+from urllib.parse import quote, urlparse
+
 import httpx
+
 from config.settings import settings
 from suppliers.sandromania.auth import build_headers
+
 
 class SandromaniaAPIError(RuntimeError):
     pass
 
+
+def _find_value(data, names):
+    """Find a non-empty value by key in nested provider responses."""
+    wanted = {name.lower() for name in names}
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if str(key).lower() in wanted and value not in (None, ""):
+                return value
+        for value in data.values():
+            found = _find_value(value, names)
+            if found not in (None, ""):
+                return found
+    elif isinstance(data, list):
+        for value in data:
+            found = _find_value(value, names)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def _find_delivery(data):
+    """
+    Return a delivered CDK or activation URL.
+    Only treats URLs as deliverables when their field name indicates delivery,
+    activation, redemption, a link, or a key. This avoids returning API/help URLs.
+    """
+    code_names = (
+        "cdk", "code", "key", "activation_code", "license_key",
+        "license", "serial", "serial_key",
+    )
+    link_names = (
+        "activation_url", "activation_link", "redeem_url", "redeem_link",
+        "delivery_url", "delivery_link", "download_url", "product_url",
+        "link", "url",
+    )
+
+    value = _find_value(data, code_names)
+    if value not in (None, "") and not isinstance(value, (dict, list)):
+        return str(value), "code"
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for key, item in obj.items():
+                key_name = str(key).lower()
+                if any(word in key_name for word in (
+                    "activation", "redeem", "delivery", "download", "link", "url"
+                )):
+                    if isinstance(item, str) and item.strip().startswith(("https://", "http://")):
+                        parsed = urlparse(item.strip())
+                        if parsed.scheme in ("http", "https") and parsed.netloc:
+                            return item.strip(), "link"
+                found = walk(item)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = walk(item)
+                if found:
+                    return found
+        return None
+
+    found = walk(data)
+    if found:
+        return found
+
+    # Some APIs return a generic "result" or "data" string containing the URL.
+    # Do not scan arbitrary strings: that could accidentally expose unrelated links.
+    return None
+
+
+def _find_status(data):
+    value = _find_value(data, ("status", "state", "order_status"))
+    return str(value or "").strip().lower()
+
+
+def _find_order_id(data):
+    value = _find_value(data, ("order_id", "orderId", "id"))
+    return str(value) if value not in (None, "") else None
+
+
 class SandromaniaClient:
-    """Partner API client using the provider's documented HMAC contract."""
+    """Partner API client using the configured signed-request contract."""
 
     def __init__(self):
         self.base_url = settings.sandromania_base_url.rstrip("/")
@@ -19,7 +102,9 @@ class SandromaniaClient:
 
     def _require_credentials(self):
         if not self.api_key or not self.api_secret:
-            raise SandromaniaAPIError("Sandromania API credentials are not configured in .env")
+            raise SandromaniaAPIError(
+                "Sandromania API credentials are not configured in .env"
+            )
 
     async def _request(self, method: str, path: str, payload=None, idempotency_key=None):
         self._require_credentials()
@@ -41,16 +126,17 @@ class SandromaniaClient:
             data = response.json()
         except ValueError:
             data = {"raw": response.text[:1000]}
+
         if response.is_error:
+            # Avoid printing credentials or full activation links in exception messages.
             raise SandromaniaAPIError(
-                f"Sandromania HTTP {response.status_code}: {str(data)[:1000]}"
+                f"Sandromania HTTP {response.status_code}: response received"
             )
         if isinstance(data, dict) and data.get("ok") is False:
-            raise SandromaniaAPIError(f"Sandromania API error: {str(data)[:1000]}")
+            raise SandromaniaAPIError("Sandromania API returned ok=false")
         return data
 
     async def health(self):
-        # Health endpoint may or may not require authentication; provider specifies signed requests.
         return await self._request("GET", "/api/v1/health")
 
     async def get_products(self):
@@ -71,49 +157,81 @@ class SandromaniaClient:
         )
 
     async def get_order(self, order_id: str):
-        from urllib.parse import quote
-        return await self._request("GET", f"/api/v1/orders/{quote(str(order_id), safe='')}")
+        path = f"/api/v1/orders/{quote(str(order_id), safe='')}"
+        return await self._request("GET", path)
 
     async def purchase_and_wait(self, supplier_product_id: int, idempotency_key: str):
         created = await self.create_order(supplier_product_id, 1, idempotency_key)
-        order_id = _find_value(created, ("order_id", "id"))
-        key = _find_value(created, ("cdk", "code", "key", "activation_code"))
-        status = str(_find_value(created, ("status", "state")) or "").lower()
 
-        if key:
-            return {"order_id": str(order_id or ""), "status": "completed", "code": str(key), "raw": created}
+        order_id = _find_order_id(created)
+        delivery = _find_delivery(created)
+        status = _find_status(created)
+
+        if delivery:
+            return {
+                "order_id": order_id or "",
+                "status": "completed",
+                "code": delivery[0],          # Backward compatibility with existing callers
+                "delivery": delivery[0],
+                "delivery_type": delivery[1],
+                "raw": created,
+            }
+
         if not order_id:
             raise SandromaniaAPIError(
-                "Purchase response did not contain order_id or a delivery code. "
-                "Inspect the provider's documented response schema before enabling sales."
+                "Purchase response did not contain an order ID or a delivery item"
             )
 
-        for _ in range(settings.sandromania_poll_attempts):
-            if status in {"failed", "error", "cancelled", "canceled"}:
-                raise SandromaniaAPIError(f"Supplier order failed: {created}")
-            await asyncio.sleep(settings.sandromania_poll_interval)
-            current = await self.get_order(str(order_id))
-            key = _find_value(current, ("cdk", "code", "key", "activation_code"))
-            status = str(_find_value(current, ("status", "state")) or status).lower()
-            if key:
-                return {"order_id": str(order_id), "status": "completed", "code": str(key), "raw": current}
-            if status in {"failed", "error", "cancelled", "canceled"}:
-                raise SandromaniaAPIError(f"Supplier order failed: {current}")
-        return {"order_id": str(order_id), "status": "processing", "code": None, "raw": current}
+        current = created
+        success_statuses = {
+            "completed", "complete", "success", "successful",
+            "done", "fulfilled", "paid", "finished",
+        }
+        failure_statuses = {
+            "failed", "error", "cancelled", "canceled", "rejected",
+        }
 
-def _find_value(data, names):
-    """Search common response wrappers without assuming one undocumented schema."""
-    if isinstance(data, dict):
-        for name in names:
-            if data.get(name) not in (None, ""):
-                return data[name]
-        for value in data.values():
-            found = _find_value(value, names)
-            if found not in (None, ""):
-                return found
-    elif isinstance(data, list):
-        for value in data:
-            found = _find_value(value, names)
-            if found not in (None, ""):
-                return found
-    return None
+        for attempt in range(settings.sandromania_poll_attempts):
+            if status in failure_statuses:
+                raise SandromaniaAPIError(
+                    f"Supplier order {order_id} has failure status: {status}"
+                )
+
+            # A completed status without a delivery item is not enough to send a
+            # fabricated code. Fetch the final order payload once more if possible.
+            if attempt > 0 or status not in success_statuses:
+                await asyncio.sleep(settings.sandromania_poll_interval)
+
+            current = await self.get_order(order_id)
+            delivery = _find_delivery(current)
+            status = _find_status(current) or status
+
+            if delivery:
+                return {
+                    "order_id": order_id,
+                    "status": "completed",
+                    "code": delivery[0],
+                    "delivery": delivery[0],
+                    "delivery_type": delivery[1],
+                    "raw": current,
+                }
+
+            if status in failure_statuses:
+                raise SandromaniaAPIError(
+                    f"Supplier order {order_id} has failure status: {status}"
+                )
+
+            # If provider says completed but has no recognized delivery field,
+            # keep the order pending manual reconciliation instead of guessing.
+            if status in success_statuses:
+                break
+
+        return {
+            "order_id": order_id,
+            "status": "processing",
+            "code": None,
+            "delivery": None,
+            "delivery_type": None,
+            "provider_status": status,
+            "raw": current,
+        }

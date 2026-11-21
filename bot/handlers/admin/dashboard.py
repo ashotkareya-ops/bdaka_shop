@@ -1,11 +1,13 @@
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from sqlalchemy import select, text
+from sqlalchemy import select, text, delete, func
 from sqlalchemy.exc import IntegrityError
 import logging
+from html import escape
 from config.settings import settings
 from database.models.order import Order
 from database.models.category import Category
@@ -13,6 +15,7 @@ from database.models.product import Product
 from database.models.digital_key import DigitalKey
 from database.models.user import User
 from database.models.transaction import Transaction
+from database.models.payment import Payment
 from bot.keyboards.admin import admin_keyboard
 
 router = Router()
@@ -20,30 +23,570 @@ router = Router()
 
 class MarkupStates(StatesGroup):
     waiting_for_custom_markup = State()
+
+
+class DescriptionStates(StatesGroup):
+    waiting_for_description = State()
+
+
+class CategoryStates(StatesGroup):
+    waiting_for_new_name = State()
+    waiting_for_rename = State()
 log = logging.getLogger(__name__)
 
 def is_admin(message):
     return message.from_user and message.from_user.id in settings.admins
+
+
+def _order_status_label(status: str) -> str:
+    labels = {
+        "COMPLETED": "✅ Успешно завершён — товар выдан",
+        "PROCESSING": "⏳ Принят — ожидает завершения выдачи",
+        "PAID": "💳 Оплата получена — выдача ожидается",
+        "PENDING": "🕓 Ожидает оплаты",
+        "FAILED": "❌ Ошибка сделки",
+        "CANCELLED": "🚫 Отменён",
+    }
+    return labels.get(str(status).upper(), f"❔ {escape(str(status))}")
+
+
+async def _get_detailed_orders(session, page: int = 1, page_size: int = 5):
+    total = await session.scalar(select(func.count(Order.id))) or 0
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(1, min(page, total_pages))
+    offset = (page - 1) * page_size
+
+    rows = (await session.execute(
+        select(Order, User, Product)
+        .join(User, Order.user_id == User.id)
+        .join(Product, Order.product_id == Product.id)
+        .order_by(Order.created_at.desc(), Order.id.desc())
+        .offset(offset)
+        .limit(page_size)
+    )).all()
+
+    if not rows:
+        text = "📦 <b>Заказы</b>\n\nЗаказов пока нет."
+    else:
+        blocks = [f"📦 <b>Заказы · страница {page}/{total_pages}</b>"]
+        for order, user, product in rows:
+            if user.username:
+                buyer = f"@{escape(user.username)}"
+            elif user.full_name:
+                buyer = escape(user.full_name)
+            else:
+                buyer = f"Пользователь {user.telegram_id}"
+
+            payment = await session.scalar(
+                select(Payment)
+                .where(Payment.order_id == order.id)
+                .order_by(Payment.created_at.desc())
+                .limit(1)
+            )
+            if payment:
+                provider_names = {
+                    "platega": "Platega",
+                    "manual": "Ручная оплата",
+                }
+                method = provider_names.get(
+                    str(payment.provider).lower(),
+                    escape(str(payment.provider or "Неизвестно"))
+                )
+                payment_status = str(payment.status or "UNKNOWN").upper()
+                payment_result = {
+                    "CONFIRMED": "оплата подтверждена",
+                    "PAID": "оплата подтверждена",
+                    "PENDING": "ожидает оплаты",
+                    "FAILED": "платёж не прошёл",
+                    "CANCELED": "платёж отменён",
+                    "CANCELLED": "платёж отменён",
+                }.get(payment_status, f"статус платежа: {escape(payment_status)}")
+            else:
+                method = "Внутренний баланс"
+                payment_result = "списание с баланса магазина"
+
+            created = (
+                order.created_at.strftime("%d.%m.%Y %H:%M")
+                if order.created_at else "не указана"
+            )
+            block = (
+                f"\n\n<b>Заказ #{order.id}</b>\n"
+                f"👤 Покупатель: {buyer}\n"
+                f"🆔 Telegram ID: <code>{user.telegram_id}</code>\n"
+                f"🛍 Товар: <b>{escape(product.name)}</b>\n"
+                f"💰 Сумма: <b>{order.price:.2f} ₽</b>\n"
+                f"💳 Оплата: {method} — {payment_result}\n"
+                f"📊 Сделка: {_order_status_label(order.status)}\n"
+                f"🕒 Дата: {created}"
+            )
+            if order.supplier_order_id:
+                block += f"\n🔗 Заказ поставщика: <code>{escape(str(order.supplier_order_id))}</code>"
+            blocks.append(block)
+        text = "".join(blocks)
+
+    kb = InlineKeyboardBuilder()
+    if page > 1:
+        kb.button(text="⬅️ Назад", callback_data=f"admin:orders:page:{page - 1}")
+    if page < total_pages:
+        kb.button(text="Вперёд ➡️", callback_data=f"admin:orders:page:{page + 1}")
+    kb.adjust(2)
+    kb.button(text=f"📄 Страница {page}/{total_pages}", callback_data="admin:orders:current")
+    kb.button(text="🔄 Обновить", callback_data=f"admin:orders:page:{page}")
+    kb.adjust(2, 1)
+    return text, kb.as_markup()
+
+
+
+def _category_list_keyboard(categories):
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    for category, product_count in categories:
+        status = "🟢" if category.is_active else "⚫"
+        kb.button(
+            text=f"{status} {category.name[:35]} · #{category.id} ({product_count})",
+            callback_data=f"admin:category:manage:{category.id}",
+        )
+    kb.button(text="➕ Создать категорию", callback_data="admin:category:create")
+    kb.button(text="⬅️ В меню", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def _category_rows(session):
+    return (await session.execute(
+        select(Category, func.count(Product.id))
+        .outerjoin(Product, Product.category_id == Category.id)
+        .group_by(Category.id)
+        .order_by(Category.name)
+    )).all()
+
+
+async def _show_categories(target, session, edit=False):
+    rows = await _category_rows(session)
+    if rows:
+        text = (
+            "📁 <b>Управление категориями</b>\n\n"
+            "🟢 — категория включена\n"
+            "⚫ — категория отключена\n"
+            "В скобках указано количество товаров.\n\n"
+            "Выбери категорию для управления:"
+        )
+    else:
+        text = "📁 <b>Управление категориями</b>\n\nКатегорий пока нет."
+    markup = _category_list_keyboard(rows)
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=markup)
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=markup)
+
+
+def _category_actions_keyboard(category, product_count):
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✏️ Переименовать", callback_data=f"admin:category:rename:{category.id}")
+    if category.is_active:
+        kb.button(text="⏸ Отключить", callback_data=f"admin:category:toggle:{category.id}")
+    else:
+        kb.button(text="▶️ Включить", callback_data=f"admin:category:toggle:{category.id}")
+    if product_count > 0:
+        kb.button(text="📦 Перенести товары в другую категорию", callback_data=f"admin:category:move:from:{category.id}")
+    else:
+        kb.button(text="🗑 Удалить категорию", callback_data=f"admin:category:delete:{category.id}")
+    kb.button(text="⬅️ К категориям", callback_data="admin:categories")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def _show_category_detail(callback, session, category_id):
+    category = await session.get(Category, category_id)
+    if not category:
+        await callback.answer("Категория не найдена", show_alert=True)
+        return
+    count = await session.scalar(
+        select(func.count(Product.id)).where(Product.category_id == category_id)
+    ) or 0
+    await callback.message.edit_text(
+        f"📁 <b>{escape(category.name)}</b>\n"
+        f"ID: <code>{category.id}</code>\n"
+        f"Товаров: <b>{count}</b>\n"
+        f"Статус: {'🟢 Включена' if category.is_active else '⚫ Отключена'}\n\n"
+        "Выбери действие:",
+        reply_markup=_category_actions_keyboard(category, count),
+    )
+    await callback.answer()
+
+
+@router.message(Command("categories"))
+async def categories_command(message: Message, session):
+    if not is_admin(message):
+        return
+    await _show_categories(message, session)
+
+
+@router.message(Command("deletecategory"))
+async def delete_category_command(message: Message, session):
+    if not is_admin(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Формат: /deletecategory ID\nСписок: /categories")
+        return
+    category_id = int(parts[1])
+    category = await session.get(Category, category_id)
+    if not category:
+        await message.answer("Категория не найдена.")
+        return
+    count = await session.scalar(
+        select(func.count(Product.id)).where(Product.category_id == category_id)
+    ) or 0
+    if count:
+        await message.answer(
+            f"Нельзя удалить «{escape(category.name)}»: в ней {count} товар(ов). "
+            "Сначала перенеси или удали товары."
+        )
+        return
+    name = category.name
+    await session.delete(category)
+    await session.commit()
+    await message.answer(f"🗑 Категория «{escape(name)}» удалена.")
+
+
+@router.callback_query(F.data == "admin:categories")
+async def admin_categories(callback: CallbackQuery, session):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await _show_categories(callback, session)
+
+
+@router.callback_query(F.data == "admin:category:create")
+async def admin_category_create(callback: CallbackQuery, state: FSMContext):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(CategoryStates.waiting_for_new_name)
+    await callback.message.answer(
+        "➕ Отправь название новой категории отдельным сообщением.\n"
+        "Для отмены используй /cancel."
+    )
+    await callback.answer()
+
+
+@router.message(CategoryStates.waiting_for_new_name, Command("cancel"))
+@router.message(CategoryStates.waiting_for_rename, Command("cancel"))
+async def cancel_category_edit(message: Message, state: FSMContext):
+    if not is_admin(message):
+        await state.clear()
+        return
+    await state.clear()
+    await message.answer("Действие с категорией отменено.")
+
+
+@router.message(CategoryStates.waiting_for_new_name)
+async def admin_category_create_save(message: Message, state: FSMContext, session):
+    if not is_admin(message):
+        return
+    name = (message.text or "").strip()
+    if not name or len(name) > 120 or name.startswith("/"):
+        await message.answer("Название должно содержать от 1 до 120 символов. Попробуй ещё раз.")
+        return
+    exists = await session.scalar(select(Category).where(func.lower(Category.name) == name.lower()))
+    if exists:
+        await message.answer("Категория с таким названием уже существует.")
+        return
+    session.add(Category(name=name, is_active=True))
+    await session.commit()
+    await state.clear()
+    await message.answer(f"✅ Категория «{escape(name)}» создана.")
+    await _show_categories(message, session)
+
+
+@router.callback_query(F.data.startswith("admin:category:manage:"))
+async def admin_category_manage(callback: CallbackQuery, session):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        category_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+    await _show_category_detail(callback, session, category_id)
+
+
+@router.callback_query(F.data.startswith("admin:category:rename:"))
+async def admin_category_rename(callback: CallbackQuery, state: FSMContext, session):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        category_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+    category = await session.get(Category, category_id)
+    if not category:
+        await callback.answer("Категория не найдена", show_alert=True)
+        return
+    await state.set_state(CategoryStates.waiting_for_rename)
+    await state.update_data(rename_category_id=category_id)
+    await callback.message.answer(
+        f"✏️ Отправь новое название для категории «{escape(category.name)}».\n"
+        "Для отмены используй /cancel."
+    )
+    await callback.answer()
+
+
+@router.message(CategoryStates.waiting_for_rename)
+async def admin_category_rename_save(message: Message, state: FSMContext, session):
+    if not is_admin(message):
+        return
+    name = (message.text or "").strip()
+    data = await state.get_data()
+    category_id = data.get("rename_category_id")
+    if not name or len(name) > 120 or name.startswith("/"):
+        await message.answer("Название должно содержать от 1 до 120 символов. Попробуй ещё раз.")
+        return
+    category = await session.get(Category, category_id)
+    if not category:
+        await state.clear()
+        await message.answer("Категория больше не существует.")
+        return
+    exists = await session.scalar(
+        select(Category).where(func.lower(Category.name) == name.lower(), Category.id != category_id)
+    )
+    if exists:
+        await message.answer("Другая категория уже использует это название.")
+        return
+    category.name = name
+    await session.commit()
+    await state.clear()
+    await message.answer(f"✅ Название категории изменено на «{escape(name)}».")
+    await _show_categories(message, session)
+
+
+@router.callback_query(F.data.startswith("admin:category:toggle:"))
+async def admin_category_toggle(callback: CallbackQuery, session):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        category_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+    category = await session.get(Category, category_id)
+    if not category:
+        await callback.answer("Категория не найдена", show_alert=True)
+        return
+    category.is_active = not category.is_active
+    await session.commit()
+    await _show_category_detail(callback, session, category_id)
+
+
+@router.callback_query(F.data.startswith("admin:category:move:from:"))
+async def admin_category_move_from(callback: CallbackQuery, session):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        source_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+    source = await session.get(Category, source_id)
+    if not source:
+        await callback.answer("Категория не найдена", show_alert=True)
+        return
+    targets = (await session.scalars(
+        select(Category).where(Category.id != source_id).order_by(Category.name)
+    )).all()
+    if not targets:
+        await callback.answer("Сначала создай другую категорию", show_alert=True)
+        return
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    for target in targets:
+        kb.button(
+            text=f"{'🟢' if target.is_active else '⚫'} {target.name[:35]} · #{target.id}",
+            callback_data=f"admin:category:move:choose:{source_id}:{target.id}",
+        )
+    kb.button(text="⬅️ Назад", callback_data=f"admin:category:manage:{source_id}")
+    kb.adjust(1)
+    await callback.message.edit_text(
+        f"📦 Выбери категорию, куда перенести все товары из «{escape(source.name)}»:",
+        reply_markup=kb.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:category:move:choose:"))
+async def admin_category_move_choose(callback: CallbackQuery, session):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, _, _, _, source_id, target_id = callback.data.split(":")
+        source_id, target_id = int(source_id), int(target_id)
+    except (ValueError, TypeError):
+        await callback.answer("Некорректные категории", show_alert=True)
+        return
+    source = await session.get(Category, source_id)
+    target = await session.get(Category, target_id)
+    if not source or not target or source_id == target_id:
+        await callback.answer("Категория не найдена", show_alert=True)
+        return
+    count = await session.scalar(
+        select(func.count(Product.id)).where(Product.category_id == source_id)
+    ) or 0
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text=f"✅ Перенести {count} товар(ов)",
+        callback_data=f"admin:category:move:apply:{source_id}:{target_id}",
+    )
+    kb.button(text="↩️ Отмена", callback_data=f"admin:category:manage:{source_id}")
+    kb.adjust(1)
+    await callback.message.edit_text(
+        f"Подтверди перенос всех товаров из «{escape(source.name)}» "
+        f"в «{escape(target.name)}».\nКоличество товаров: <b>{count}</b>.",
+        reply_markup=kb.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:category:move:apply:"))
+async def admin_category_move_apply(callback: CallbackQuery, session):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, _, _, _, source_id, target_id = callback.data.split(":")
+        source_id, target_id = int(source_id), int(target_id)
+    except (ValueError, TypeError):
+        await callback.answer("Некорректные категории", show_alert=True)
+        return
+    source = await session.get(Category, source_id)
+    target = await session.get(Category, target_id)
+    if not source or not target or source_id == target_id:
+        await callback.answer("Категория не найдена", show_alert=True)
+        return
+    products = (await session.scalars(
+        select(Product).where(Product.category_id == source_id)
+    )).all()
+    moved = len(products)
+    for product in products:
+        product.category_id = target_id
+    await session.commit()
+    await callback.message.edit_text(
+        f"✅ Перенесено товаров: <b>{moved}</b>\n"
+        f"Из: {escape(source.name)}\nВ: {escape(target.name)}",
+        reply_markup=_category_actions_keyboard(source, 0),
+    )
+    await callback.answer("Товары перенесены")
+
+
+@router.callback_query(F.data.startswith("admin:category:delete:"))
+async def admin_category_delete(callback: CallbackQuery, session):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        category_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+    category = await session.get(Category, category_id)
+    if not category:
+        await callback.answer("Категория не найдена", show_alert=True)
+        return
+    count = await session.scalar(
+        select(func.count(Product.id)).where(Product.category_id == category_id)
+    ) or 0
+    if count:
+        await callback.answer("Категория не пуста — сначала перенеси товары.", show_alert=True)
+        return
+    name = category.name
+    await session.delete(category)
+    await session.commit()
+    rows = await _category_rows(session)
+    await callback.message.edit_text(
+        f"🗑 Категория «{escape(name)}» удалена.",
+        reply_markup=_category_list_keyboard(rows),
+    )
+    await callback.answer("Удалено")
+
+
+@router.callback_query(F.data == "admin:commands")
+async def admin_commands_callback(callback: CallbackQuery):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.message.edit_text(
+        _admin_commands_text(),
+        reply_markup=_admin_commands_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "ui:close")
+async def close_message_callback(callback: CallbackQuery):
+    try:
+        await callback.message.delete()
+    except Exception:
+        await callback.answer("Не удалось закрыть сообщение", show_alert=True)
+        return
+    await callback.answer("Закрыто")
+
+
+def _admin_commands_text():
+    return (
+        "🛠 <b>Команды администратора</b>\n\n"
+        "/admin — открыть панель администратора\n"
+        "/adminhelp — список команд администратора\n"
+        "/categories — управление категориями\n"
+        "/addcategory НАЗВАНИЕ — создать категорию\n"
+        "/deletecategory ID — удалить пустую категорию\n"
+        "/addproduct CATEGORY_ID | НАЗВАНИЕ | ЦЕНА | ОПИСАНИЕ — создать товар\n"
+        "/products — список товаров и ID\n"
+        "/setprice PRODUCT_ID ЦЕНА — изменить розничную цену\n"
+        "/setmarkup ПРОЦЕНТ — изменить наценку поставщика\n"
+        "/setdescription PRODUCT_ID — изменить описание\n"
+        "/addkey PRODUCT_ID | CDK — добавить CDK\n"
+        "/credit USER_ID СУММА — начислить баланс\n"
+        "/orders — список заказов по страницам\n"
+        "/linksupplier PRODUCT_ID SUPPLIER_ID — связать товар с поставщиком\n"
+        "/supplierbalance — баланс Sandromania\n"
+        "/supplierproducts — информация о каталоге поставщика\n"
+        "/syncsupplier — синхронизировать каталог\n"
+        "/cancel — отменить текущий ввод\n"
+        "/clear — очистить описание товара"
+    )
+
+
+def _admin_commands_keyboard():
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ В меню администратора", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+@router.message(Command("adminhelp"))
+async def admin_help_command(message: Message):
+    if not is_admin(message):
+        return
+    await message.answer(_admin_commands_text(), reply_markup=_admin_commands_keyboard())
+
 
 @router.message(Command("admin"))
 async def admin_help(message: Message):
     if not is_admin(message):
         return
     await message.answer(
-        "<b>Панель администратора</b>\n"
-        "Управление ценами, синхронизацией и заказами:",
+        "<b>Панель администратора</b>\nВыбери нужный раздел:",
         reply_markup=admin_keyboard(),
-    )
-    await message.answer(
-        "<b>Дополнительные команды</b>\n"
-        "/addcategory Название\n"
-        "/addproduct CATEGORY_ID | Название | Цена | Описание\n"
-        "/addkey PRODUCT_ID | CDK\n"
-        "/products — список товаров\n"
-        "/credit USER_ID СУММА\n"
-        "/orders — последние заказы\n"
-        "/syncsupplier — синхронизация каталога\n"
-        "/setprice PRODUCT_ID ЦЕНА — ручная цена"
     )
 
 @router.message(Command("addcategory"))
@@ -77,6 +620,81 @@ async def add_product(message: Message, session):
     session.add(product)
     await session.commit()
     await message.answer(f"Товар создан. ID: {product.id}")
+
+@router.message(Command("setdescription"))
+async def set_product_description(message: Message, state: FSMContext, session):
+    if not is_admin(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip().isdigit():
+        await message.answer("Формат: /setdescription PRODUCT_ID")
+        return
+    product_id = int(parts[1].strip())
+    product = await session.get(Product, product_id)
+    if not product:
+        await message.answer("Товар не найден. Используй /products.")
+        return
+    await state.set_state(DescriptionStates.waiting_for_description)
+    await state.update_data(description_product_id=product_id)
+    await message.answer(
+        f"Отправь новое описание для товара «{product.name}».\n"
+        "Можно отправить несколько абзацев. Чтобы удалить описание, отправь /clear.\n"
+        "Для отмены — /cancel."
+    )
+
+
+@router.message(DescriptionStates.waiting_for_description, Command("cancel"))
+async def cancel_description_edit(message: Message, state: FSMContext):
+    if not is_admin(message):
+        await state.clear()
+        return
+    await state.clear()
+    await message.answer("Редактирование описания отменено.")
+
+
+@router.message(DescriptionStates.waiting_for_description, Command("clear"))
+async def clear_product_description(message: Message, state: FSMContext, session):
+    if not is_admin(message):
+        await state.clear()
+        return
+    data = await state.get_data()
+    product = await session.get(Product, data.get("description_product_id"))
+    if not product:
+        await state.clear()
+        await message.answer("Товар не найден.")
+        return
+    product.description = ""
+    await session.commit()
+    await state.clear()
+    await message.answer(f"Описание товара «{product.name}» очищено.")
+
+
+@router.message(DescriptionStates.waiting_for_description)
+async def save_product_description(message: Message, state: FSMContext, session):
+    if not is_admin(message):
+        await state.clear()
+        return
+    description = (message.text or message.caption or "").strip()
+    if not description:
+        await message.answer("Пришли текстовое описание сообщением.")
+        return
+    if len(description) > 10000:
+        await message.answer("Описание слишком длинное. Максимум — 10 000 символов.")
+        return
+    data = await state.get_data()
+    product = await session.get(Product, data.get("description_product_id"))
+    if not product:
+        await state.clear()
+        await message.answer("Товар не найден.")
+        return
+    product.description = description
+    await session.commit()
+    await state.clear()
+    await message.answer(
+        f"✅ Описание сохранено для товара «{product.name}».\n"
+        "Оно будет показываться в карточке товара, но не на экране оплаты."
+    )
+
 
 @router.message(Command("products"))
 async def list_products(message: Message, session):
@@ -167,14 +785,10 @@ async def credit_user(message: Message, session):
 
 @router.message(Command("orders"))
 async def orders(message: Message, session):
-    if not is_admin(message): return
-    rows = (await session.scalars(select(Order).order_by(Order.created_at.desc()).limit(15))).all()
-    if not rows:
-        await message.answer("Заказов пока нет.")
+    if not is_admin(message):
         return
-    await message.answer("\n".join(
-        f"#{o.id} | user={o.user_id} | {o.price:.2f} ₽ | {o.status}" for o in rows
-    ))
+    text, keyboard = await _get_detailed_orders(session, page=1, page_size=5)
+    await message.answer(text, reply_markup=keyboard, disable_web_page_preview=True)
 
 
 @router.message(Command("linksupplier"))
@@ -233,11 +847,12 @@ async def set_retail_price(message: Message, session):
         await message.answer("Товар не найден. Используй /products.")
         return
     product.price = price
-    product.is_active = True
+    # Do not reactivate an intentionally hidden product when its price changes.
+    active_label = "активен" if product.is_active else "выключен"
     await session.commit()
     await message.answer(
         f"Розничная цена товара «{product.name}» установлена: {price:.2f} ₽. "
-        "Товар активирован."
+        f"Статус товара не изменён: {active_label}."
     )
 
 
@@ -271,8 +886,6 @@ async def set_markup(message: Message, session):
         product.price = round(product.supplier_cost * (1 + markup / 100), 2)
         # Keep products visible in catalogue if already published; availability is
         # checked separately and blocks checkout when stock is zero or unknown.
-        if product.supplier_available and (product.supplier_stock is None or product.supplier_stock > 0):
-            product.is_active = True
         changed += 1
     await session.commit()
     await message.answer(
@@ -317,6 +930,251 @@ async def supplier_products(message: Message):
 
 
 # ---------- Интерактивная панель управления наценкой ----------
+
+@router.callback_query(F.data == "admin:descriptions")
+async def admin_descriptions(callback: CallbackQuery, session):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    rows = (await session.scalars(select(Product).order_by(Product.name).limit(50))).all()
+    if not rows:
+        await callback.message.edit_text("В базе пока нет товаров.", reply_markup=admin_keyboard())
+        await callback.answer()
+        return
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    for product in rows:
+        status = "есть описание" if (product.description or "").strip() else "без описания"
+        kb.button(
+            text=f"{product.name[:42]} · {status}",
+            callback_data=f"admin:description:edit:{product.id}",
+        )
+    kb.button(text="⬅️ В меню", callback_data="admin:home")
+    kb.adjust(1)
+    await callback.message.edit_text(
+        "<b>📝 Описания товаров</b>\nВыбери товар, описание которого нужно добавить или изменить:",
+        reply_markup=kb.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:description:edit:"))
+async def admin_description_edit(callback: CallbackQuery, state: FSMContext, session):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        product_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный товар", show_alert=True)
+        return
+    product = await session.get(Product, product_id)
+    if not product:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+    await state.set_state(DescriptionStates.waiting_for_description)
+    await state.update_data(description_product_id=product.id)
+    await callback.message.answer(
+        f"📝 <b>{product.name}</b>\n"
+        "Отправь новое описание следующим сообщением. Можно использовать эмодзи и переносы строк.\n"
+        "Чтобы удалить описание, отправь /clear. Для отмены — /cancel."
+    )
+    await callback.answer()
+
+
+
+# ---------- Управление товарами: включение, отключение и полное удаление ----------
+
+def _product_management_keyboard(products):
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    for product in products:
+        state = "🟢" if product.is_active else "⚫"
+        kb.button(
+            text=f"{state} {product.name[:38]} · #{product.id}",
+            callback_data=f"admin:product:manage:{product.id}",
+        )
+    kb.button(text="⬅️ В меню", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def _product_actions_keyboard(product):
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    if product.is_active:
+        kb.button(text="⏸ Отключить из каталога", callback_data=f"admin:product:toggle:{product.id}:off")
+    else:
+        kb.button(text="▶️ Включить в каталог", callback_data=f"admin:product:toggle:{product.id}:on")
+    kb.button(text="🗑 Удалить товар полностью", callback_data=f"admin:product:delete:confirm:{product.id}")
+    kb.button(text="⬅️ К списку товаров", callback_data="admin:products")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+@router.callback_query(F.data == "admin:products")
+async def admin_products_list(callback: CallbackQuery, session):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    products = (await session.scalars(select(Product).order_by(Product.name).limit(100))).all()
+    if not products:
+        await callback.message.edit_text("В базе пока нет товаров.", reply_markup=admin_keyboard())
+    else:
+        await callback.message.edit_text(
+            "<b>📦 Управление товарами</b>\n\n"
+            "🟢 — отображается в каталоге\n"
+            "⚫ — отключён\n\nВыбери товар:",
+            reply_markup=_product_management_keyboard(products),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:product:manage:"))
+async def admin_product_manage(callback: CallbackQuery, session):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        product_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+    product = await session.get(Product, product_id)
+    if not product:
+        await callback.answer("Товар уже удалён или не найден", show_alert=True)
+        return
+    local_keys = await session.scalar(
+        select(func.count(DigitalKey.id)).where(DigitalKey.product_id == product_id)
+    )
+    orders_count = await session.scalar(
+        select(func.count(Order.id)).where(Order.product_id == product_id)
+    )
+    await callback.message.edit_text(
+        f"<b>📦 {product.name}</b>\n"
+        f"ID: <code>{product.id}</code>\n"
+        f"Цена: {product.price:.2f} ₽\n"
+        f"Статус: {'🟢 Активен' if product.is_active else '⚫ Отключён'}\n"
+        f"CDK-записей: {local_keys}\n"
+        f"Заказов: {orders_count}\n\n"
+        "Выбери действие:",
+        reply_markup=_product_actions_keyboard(product),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:product:toggle:"))
+async def admin_product_toggle(callback: CallbackQuery, session):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    try:
+        product_id = int(parts[3])
+        turn_on = parts[4] == "on"
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная команда", show_alert=True)
+        return
+    product = await session.get(Product, product_id)
+    if not product:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+    product.is_active = turn_on
+    await session.commit()
+    # Refresh before showing updated state.
+    await session.refresh(product)
+    await callback.message.edit_text(
+        f"<b>📦 {product.name}</b>\n"
+        f"Статус изменён: {'🟢 Активен в каталоге' if turn_on else '⚫ Отключён от каталога'}.\n\n"
+        "Изменение сохранено в базе данных.",
+        reply_markup=_product_actions_keyboard(product),
+    )
+    await callback.answer("Товар включён" if turn_on else "Товар отключён")
+
+
+@router.callback_query(F.data.startswith("admin:product:delete:confirm:"))
+async def admin_product_delete_confirm(callback: CallbackQuery, session):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        product_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+    product = await session.get(Product, product_id)
+    if not product:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+    orders_count = await session.scalar(
+        select(func.count(Order.id)).where(Order.product_id == product_id)
+    )
+    keys_count = await session.scalar(
+        select(func.count(DigitalKey.id)).where(DigitalKey.product_id == product_id)
+    )
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⚠️ Да, удалить полностью", callback_data=f"admin:product:delete:do:{product_id}")
+    kb.button(text="Отмена", callback_data=f"admin:product:manage:{product_id}")
+    kb.adjust(1)
+    await callback.message.edit_text(
+        f"⚠️ <b>Полное удаление товара</b>\n\n"
+        f"Товар: <b>{product.name}</b> (ID {product.id})\n"
+        f"Будут удалены CDK-записи: <b>{keys_count}</b>\n"
+        f"Будут удалены заказы: <b>{orders_count}</b>\n"
+        "Также будут удалены связанные платежи этих заказов.\n\n"
+        "<b>Это действие необратимо.</b> Покупки исчезнут из истории заказов пользователей. "
+        "Записи бухгалтерских транзакций пользователей сохраняются отдельно.",
+        reply_markup=kb.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:product:delete:do:"))
+async def admin_product_delete_do(callback: CallbackQuery, session):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        product_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+    product = await session.get(Product, product_id)
+    if not product:
+        await callback.answer("Товар уже удалён", show_alert=True)
+        return
+
+    in_flight = await session.scalar(
+        select(func.count(Order.id)).where(
+            Order.product_id == product_id,
+            Order.status.in_(["PENDING", "PAID", "PROCESSING"]),
+        )
+    )
+    if in_flight:
+        await callback.answer(
+            f"Нельзя удалить: у товара {in_flight} незавершённых заказов. "
+            "Сначала разберись с ними.",
+            show_alert=True,
+        )
+        return
+
+    # Remove dependent rows in FK-safe order. Keep generic user ledger transactions.
+    order_ids = select(Order.id).where(Order.product_id == product_id)
+    await session.execute(delete(Payment).where(Payment.order_id.in_(order_ids)))
+    await session.execute(delete(DigitalKey).where(DigitalKey.product_id == product_id))
+    await session.execute(delete(Order).where(Order.product_id == product_id))
+    product_name = product.name
+    await session.delete(product)
+    await session.commit()
+
+    await callback.message.edit_text(
+        f"🗑 Товар <b>{product_name}</b> (ID {product_id}) полностью удалён.\n"
+        "Связанные CDK, заказы и платежи удалены. "
+        "Общие записи балансовых транзакций сохранены.",
+        reply_markup=admin_keyboard(),
+    )
+    await callback.answer("Товар удалён")
 
 def _is_admin_callback(callback: CallbackQuery) -> bool:
     return bool(callback.from_user and callback.from_user.id in settings.admins)
@@ -477,8 +1335,6 @@ async def admin_markup_apply(callback: CallbackQuery, session):
     for product in rows:
         product.markup_percent = markup
         product.price = round(float(product.supplier_cost) * (1 + markup / 100), 2)
-        if product.supplier_available and (product.supplier_stock is None or product.supplier_stock > 0):
-            product.is_active = True
     await session.commit()
     await callback.message.edit_text(
         f"✅ Наценка <b>{markup:g}%</b> установлена.\n"
@@ -529,13 +1385,33 @@ async def admin_orders_callback(callback: CallbackQuery, session):
     if not _is_admin_callback(callback):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    rows = (await session.scalars(
-        select(Order).order_by(Order.created_at.desc()).limit(15)
-    )).all()
-    if not rows:
-        await callback.message.answer("Заказов пока нет.")
-    else:
-        await callback.message.answer("\n".join(
-            f"#{o.id} | user={o.user_id} | {o.price:.2f} ₽ | {o.status}" for o in rows
-        ))
+    text, keyboard = await _get_detailed_orders(session, page=1, page_size=5)
+    await callback.message.answer(text, reply_markup=keyboard, disable_web_page_preview=True)
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:orders:page:"))
+async def admin_orders_page_callback(callback: CallbackQuery, session):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        page = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная страница", show_alert=True)
+        return
+    text, keyboard = await _get_detailed_orders(session, page=page, page_size=5)
+    try:
+        await callback.message.edit_text(
+            text, reply_markup=keyboard, disable_web_page_preview=True
+        )
+    except Exception:
+        await callback.message.answer(
+            text, reply_markup=keyboard, disable_web_page_preview=True
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:orders:current")
+async def admin_orders_current_callback(callback: CallbackQuery):
+    await callback.answer("Текущая страница заказов")

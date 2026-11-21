@@ -67,3 +67,13 @@
 до добавления реальных пользователей/заказов либо создать миграцию Alembic.
 Не удаляйте рабочую базу с реальными заказами. В частности, новые поля `supplier_name`,
 `supplier_product_id`, `supplier_order_id`, `idempotency_key` требуют миграции.
+
+## Полезные ссылки магазина
+
+Ссылки задаются в `.env`:
+- `SHOP_REVIEWS_URL` — отзывы и логи: `https://t.me/bdaka_reviews`
+- `SHOP_NEWS_URL` — новости магазина: `https://t.me/bdaka_store`
+- `SHOP_CHAT_URL` — чат магазина: `https://t.me/+jBNfIlXR13RhNmUy`
+- `SHOP_SUPPORT_URL` — поддержка: `https://t.me/bdaka1`
+
+Эти ссылки доступны в разделе «Полезные ссылки» и в профиле.
