@@ -28,7 +28,7 @@ async def purchases(callback: CallbackQuery, session):
     if not rows:
         text = "📦 <b>МОИ ПОКУПКИ</b>\n\nПокупок пока нет."
     else:
-        lines = ["📦 <b>МОИ ПОКУПКИ</b>", "━━━━━━━━━━━━━━━━━━"]
+        lines = ["📦 <b>МОИ ПОКУПКИ</b>"]
         for order, product in rows:
             lines.append(f"Заказ #{order.id} — {product.name} — {order.price:.2f} ₽ — {order.status}")
         text = "\n".join(lines)
@@ -53,7 +53,7 @@ async def purchases_command(message: Message, session):
     if not rows:
         text = "📦 <b>МОИ ПОКУПКИ</b>\n\nПокупок пока нет."
     else:
-        lines = ["📦 <b>МОИ ПОКУПКИ</b>", "━━━━━━━━━━━━━━━━━━"]
+        lines = ["📦 <b>МОИ ПОКУПКИ</b>"]
         for order, product in rows:
             lines.append(f"Заказ #{order.id} — {product.name} — {order.price:.2f} ₽ — {order.status}")
         text = "\n".join(lines)

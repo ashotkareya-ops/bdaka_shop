@@ -1,6 +1,6 @@
 from aiogram import Router
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove
+from aiogram.types import Message, CallbackQuery
 from sqlalchemy import select
 from database.models.user import User
 from bot.utils.section_media import send_section
@@ -9,12 +9,9 @@ from bot.keyboards.main import main_menu
 router = Router()
 
 async def show_main_menu(target, user_name: str = "покупатель"):
-    # Remove the old persistent reply keyboard first; the real navigation is
-    # an inline keyboard attached directly to the BDAKA Shop welcome photo.
-    await target.answer("\u2060", reply_markup=ReplyKeyboardRemove())
     text = (
         f"👋 Добро пожаловать в <b>BDAKA SHOP</b>, {user_name}!\n\n"
-        "Используйте меню команд Telegram (значок /), чтобы открыть каталог, профиль и другие разделы."
+        "<i>Выберите нужный раздел в меню ниже</i>"
     )
     await send_section(
         target, "home.png", text,
@@ -49,6 +46,10 @@ async def start(message: Message, session):
 
 @router.message(Command("help"))
 async def buyer_help(message: Message):
+    try:
+        await message.delete()
+    except Exception:
+        pass
     await message.answer(
         "<b>Команды покупателя</b>\n"
         "/start — главное меню\n"

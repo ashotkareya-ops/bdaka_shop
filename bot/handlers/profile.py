@@ -10,8 +10,7 @@ router = Router()
 
 async def _send_profile(target, user):
     text = (
-        "👤 <b>ПРОФИЛЬ BDAKA SHOP</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
+        "👤 <b>ПРОФИЛЬ</b>\n"
         f"🆔 ID: <code>{user.telegram_id}</code>\n"
         f"💰 Баланс: <b>{user.balance:.2f} ₽</b>\n"
         f"🛍 Покупок: <b>{user.purchase_count}</b>\n\n"

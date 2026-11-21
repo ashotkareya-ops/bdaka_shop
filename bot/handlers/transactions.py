@@ -31,7 +31,7 @@ async def transactions(callback: CallbackQuery, session):
         for row in rows:
             lines.append(f"{row.amount:+.2f} ₽ — {row.description}")
         text = "\n".join(lines)
-    await send_section(callback.message, "wallet.png", text, reply_markup=kb.as_markup())
+    await send_section(callback.message, "operations.png", text, reply_markup=kb.as_markup())
     await callback.answer()
 
 
@@ -56,4 +56,4 @@ async def transactions_command(message: Message, session):
         for row in rows:
             lines.append(f"{row.amount:+.2f} ₽ — {row.description}")
         text = "\n".join(lines)
-    await send_section(message, "wallet.png", text, reply_markup=kb.as_markup())
+    await send_section(message, "operations.png", text, reply_markup=kb.as_markup())

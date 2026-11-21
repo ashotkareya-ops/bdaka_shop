@@ -48,7 +48,6 @@ async def product_details(callback: CallbackQuery, session):
     description = product.description or "Описание скоро появится."
     text = (
         f"✨ <b>{product.name}</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
         f"{description}\n\n"
         f"💳 Цена: <b>{product.price:.2f} ₽</b>\n"
         f"📦 {stock_text}\n\n"
