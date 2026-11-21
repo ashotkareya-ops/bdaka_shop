@@ -30,6 +30,19 @@ class Settings(BaseSettings):
     platega_webhook_port: int = 8080
     platega_webhook_path: str = "/api/payments/platega/webhook"
 
+    # Crypto Pay (Crypto Bot): https://help.crypt.bot/crypto-pay-api
+    crypto_pay_token: str = Field(default="", alias="CRYPTO_PAY_TOKEN")
+    crypto_pay_testnet: bool = Field(default=False, alias="CRYPTO_PAY_TESTNET")
+    # Comma-separated list, e.g. "USDT,TON,BTC". Empty = every asset enabled in your Crypto Pay app.
+    crypto_pay_accepted_assets: str = Field(default="USDT,TON", alias="CRYPTO_PAY_ACCEPTED_ASSETS")
+    crypto_pay_expires_in: int = Field(default=3600, alias="CRYPTO_PAY_EXPIRES_IN")
+    crypto_pay_poll_interval: float = Field(default=15.0, alias="CRYPTO_PAY_POLL_INTERVAL")
+    crypto_pay_webhook_path: str = Field(
+        default="/api/payments/cryptobot/webhook", alias="CRYPTO_PAY_WEBHOOK_PATH"
+    )
+    # Run the local aiohttp server (webhooks + /health). Not required for Crypto Pay: polling works without it.
+    webhook_server_enabled: bool = Field(default=False, alias="WEBHOOK_SERVER_ENABLED")
+
     model_config = SettingsConfigDict(
         env_file=Path(__file__).resolve().parent.parent / ".env",
         extra="ignore",
@@ -47,6 +60,14 @@ class Settings(BaseSettings):
     @property
     def platega_enabled(self) -> bool:
         return bool(self.platega_merchant_id and self.platega_secret)
+
+    @property
+    def crypto_pay_enabled(self) -> bool:
+        return bool(self.crypto_pay_token)
+
+    @property
+    def crypto_accepted_assets(self) -> list[str]:
+        return [a.strip().upper() for a in self.crypto_pay_accepted_assets.split(",") if a.strip()]
 
     @property
     def sandromania_enabled(self) -> bool:

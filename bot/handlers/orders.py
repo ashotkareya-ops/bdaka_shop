@@ -74,6 +74,9 @@ async def buy_product(callback: CallbackQuery, session):
     if method == "stars":
         await create_stars_order(callback, session, product_id)
         return
+    if method == "crypto":
+        await create_crypto_order(callback, session, product_id)
+        return
     if method == "platega":
         await callback.answer(
             "Для цифровых товаров внутри Telegram доступна оплата только Telegram Stars.",
@@ -441,8 +444,35 @@ async def check_payment(callback: CallbackQuery, session):
         select(Payment).join(Order, Payment.order_id == Order.id)
         .where(Order.id == order_id, Order.user_id == select(User.id).where(User.telegram_id == callback.from_user.id).scalar_subquery())
     )
-    if not payment or payment.provider != "platega":
+    if not payment or payment.provider not in {"platega", "cryptobot"}:
         await callback.answer("Платёж не найден", show_alert=True)
+        return
+    if payment.provider == "cryptobot":
+        if payment.status == "CONFIRMED":
+            await callback.answer("Оплата подтверждена. Если товар ещё не пришёл, заказ обрабатывается.", show_alert=True)
+            return
+        if not payment.external_id:
+            await callback.answer("Счёт ещё создаётся", show_alert=True)
+            return
+        try:
+            from payments.providers.cryptobot import CryptoBotClient
+            from services.payment_service import process_cryptobot_invoice
+            invoice = await CryptoBotClient().get_invoice(payment.external_id)
+            if not invoice:
+                await callback.answer("Счёт не найден", show_alert=True)
+                return
+            state = str(invoice.get("status") or "").lower()
+            if state == "paid":
+                await process_cryptobot_invoice(invoice, callback.bot)
+                await callback.answer("Оплата подтверждена. Выдача товара запущена.", show_alert=True)
+            elif state == "expired":
+                await process_cryptobot_invoice(invoice, callback.bot)
+                await callback.answer("Счёт истёк. Оформите заказ заново.", show_alert=True)
+            else:
+                await callback.answer("Оплата пока не поступила. Попробуйте через минуту.", show_alert=True)
+        except Exception:
+            log.exception("Crypto payment status check failed: order_id=%s", order_id)
+            await callback.answer("Не удалось проверить статус. Попробуйте позже.", show_alert=True)
         return
     if payment.status == "CONFIRMED":
         await callback.answer("Оплата подтверждена. Если товар ещё не пришёл, заказ обрабатывается.", show_alert=True)
@@ -469,3 +499,92 @@ async def check_payment(callback: CallbackQuery, session):
     except Exception:
         log.exception("Payment status check failed: order_id=%s", order_id)
         await callback.answer("Не удалось проверить статус. Попробуйте позже.", show_alert=True)
+
+
+async def create_crypto_order(callback: CallbackQuery, session, product_id: int):
+    """Create an order and a Crypto Pay invoice (price in RUB, buyer pays in crypto)."""
+    from payments.providers.cryptobot import CryptoBotClient, CryptoBotError
+
+    if not settings.crypto_pay_enabled:
+        await callback.answer("Оплата криптовалютой пока не настроена", show_alert=True)
+        return
+    user = await session.scalar(
+        select(User).where(User.telegram_id == callback.from_user.id).with_for_update()
+    )
+    product = await session.get(Product, product_id)
+    if not user or not product or not product.is_active or product.price <= 0:
+        await callback.answer("Не удалось оформить заказ", show_alert=True)
+        return
+
+    key = await session.scalar(
+        select(DigitalKey).where(
+            DigitalKey.product_id == product.id, DigitalKey.status == "AVAILABLE"
+        ).with_for_update(skip_locked=True).limit(1)
+    )
+    use_supplier = key is None and product.supplier_name == "sandromania" and product.supplier_product_id
+    if key is None and not use_supplier:
+        await callback.answer("Товар временно отсутствует", show_alert=True)
+        return
+    if use_supplier:
+        if not settings.sandromania_enabled:
+            await callback.answer("Интеграция поставщика не настроена", show_alert=True)
+            return
+        try:
+            from services.supplier_sync import refresh_supplier_product_stock
+            live_item = await refresh_supplier_product_stock(session, product)
+        except Exception:
+            log.exception("Supplier stock check failed for product_id=%s", product.id)
+            await callback.answer("Не удалось проверить наличие. Попробуйте позже.", show_alert=True)
+            return
+        if live_item is None or not product.supplier_available or not product.supplier_stock or product.supplier_stock <= 0:
+            await callback.answer("Товар закончился.", show_alert=True)
+            return
+
+    order = Order(
+        user_id=user.id, product_id=product.id, price=product.price,
+        status=OrderStatus.PENDING.value,
+        idempotency_key=secrets.token_urlsafe(24) if use_supplier else None,
+    )
+    session.add(order)
+    await session.flush()
+    payment = Payment(
+        user_id=user.id, order_id=order.id, amount=float(product.price),
+        provider="cryptobot", status="CREATING", payload=f"crypto-order-{order.id}",
+    )
+    session.add(payment)
+    await session.commit()
+
+    try:
+        invoice = await CryptoBotClient().create_invoice(
+            product.price,
+            fiat=settings.currency,
+            accepted_assets=settings.crypto_accepted_assets,
+            description=f"BDAKA SHOP — заказ #{order.id}",
+            payload=payment.payload,
+            expires_in=settings.crypto_pay_expires_in,
+        )
+        pay_url = invoice.get("bot_invoice_url") or invoice.get("pay_url")
+        if not invoice.get("invoice_id") or not pay_url:
+            raise CryptoBotError(f"Unexpected invoice schema: keys={sorted(invoice)}")
+        payment.external_id = str(invoice["invoice_id"])
+        payment.payment_url = str(pay_url)
+        payment.status = "PENDING"
+        await session.commit()
+    except Exception:
+        log.exception("Could not create Crypto Pay invoice for order_id=%s", order.id)
+        order.status = OrderStatus.FAILED.value
+        payment.status = "FAILED"
+        await session.commit()
+        await callback.message.answer("Не удалось создать счёт. Деньги не списаны. Попробуйте позже.")
+        await callback.answer("Ошибка создания счёта", show_alert=True)
+        return
+
+    minutes = max(1, settings.crypto_pay_expires_in // 60)
+    await callback.message.answer(
+        f"🧾 <b>Заказ #{order.id} создан</b>\n"
+        f"Товар: {product.name}\n"
+        f"К оплате: <b>{product.price:.2f} ₽</b> (в криптовалюте по курсу Crypto Bot)\n"
+        f"Счёт действует {minutes} мин. Товар придёт автоматически после оплаты.",
+        reply_markup=invoice_keyboard(str(pay_url), order.id),
+    )
+    await callback.answer("Счёт создан")

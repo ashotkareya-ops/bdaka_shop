@@ -148,6 +148,10 @@ async def fulfill_paid_order(order_id: int, bot):
         result = await SandromaniaClient().purchase_and_wait(supplier_id, idem)
     except Exception:
         log.exception("Supplier fulfilment failed/uncertain for paid order %s", order_id)
+        await notify_admins(bot,
+            f"⚠️ Заказ #{order_id} оплачен, но закупка у поставщика не подтверждена "
+            f"(ошибка/таймаут/нет баланса у поставщика). Проверьте заказ вручную, "
+            f"повторно не покупайте и при необходимости сделайте возврат клиенту.")
         await bot.send_message(telegram_id,
             f"Оплата заказа #{order_id} подтверждена. Поставка обрабатывается; поддержка проверит результат.")
         return
@@ -170,5 +174,145 @@ async def fulfill_paid_order(order_id: int, bot):
             await publish_purchase_notice(bot, order_id)
         else:
             await session.commit()
+            await notify_admins(bot,
+                f"⏳ Заказ #{order_id} оплачен; поставщик принял заказ, но код ещё не выдан. Проверьте статус вручную.")
             await bot.send_message(telegram_id,
                 f"Оплата заказа #{order_id} подтверждена. Поставщик обрабатывает заказ, код придёт отдельно.")
+
+
+# ---------------------------------------------------------------------------
+# Crypto Pay (Crypto Bot)
+# ---------------------------------------------------------------------------
+
+async def notify_admins(bot, text: str):
+    """Best-effort alert to every admin; never raises."""
+    for admin_id in settings.admins:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            log.warning("Could not notify admin %s", admin_id)
+
+
+async def process_cryptobot_invoice(invoice: dict, bot) -> str:
+    """
+    Apply a Crypto Pay invoice state to our payment/order. Safe to call many times
+    (webhook, poller and the "check payment" button can all race): the payment and
+    order rows are locked and fulfilment is claimed exactly once.
+    Returns the resulting payment status.
+    """
+    invoice_id = str(invoice.get("invoice_id") or "")
+    status = str(invoice.get("status") or "").lower()
+    if not invoice_id or not status:
+        raise ValueError("Invoice is missing invoice_id/status")
+
+    newly_confirmed = False
+    telegram_id = None
+    order_id = None
+    async with SessionLocal() as session:
+        payment = await session.scalar(
+            select(Payment)
+            .where(Payment.external_id == invoice_id, Payment.provider == "cryptobot")
+            .with_for_update()
+        )
+        if not payment:
+            raise ValueError("Unknown Crypto Pay invoice")
+        if payment.order_id is None:
+            raise ValueError("Crypto Pay top-ups are not supported")
+        order = await session.scalar(
+            select(Order).where(Order.id == payment.order_id).with_for_update()
+        )
+        if not order:
+            raise ValueError("Order for payment was not found")
+        order_id = order.id
+
+        if status == "paid":
+            # Never trust the status alone: the invoice must be ours and for the exact amount.
+            if str(invoice.get("payload") or "") != (payment.payload or ""):
+                raise ValueError("Crypto Pay payload mismatch")
+            if str(invoice.get("currency_type") or "fiat") == "fiat":
+                if str(invoice.get("fiat") or "").upper() != settings.currency.upper():
+                    raise ValueError("Crypto Pay currency mismatch")
+                try:
+                    paid_amount = round(float(invoice.get("amount")), 2)
+                except (TypeError, ValueError):
+                    raise ValueError("Invalid Crypto Pay amount")
+                if paid_amount != round(float(payment.amount), 2):
+                    raise ValueError("Crypto Pay amount mismatch")
+            if payment.status != "CONFIRMED":
+                payment.status = "CONFIRMED"
+                payment.confirmed_at = datetime.utcnow()
+                newly_confirmed = True
+                if order.status == OrderStatus.PENDING.value:
+                    order.status = OrderStatus.PAID.value
+                user = await session.get(User, payment.user_id)
+                telegram_id = user.telegram_id if user else None
+            await session.commit()
+        elif status == "expired":
+            if payment.status == "PENDING":
+                payment.status = "EXPIRED"
+                if order.status == OrderStatus.PENDING.value:
+                    order.status = OrderStatus.CANCELLED.value
+            await session.commit()
+            return payment.status
+        else:
+            return payment.status  # "active": still waiting for the buyer
+
+    if newly_confirmed and telegram_id:
+        try:
+            await bot.send_message(
+                telegram_id,
+                f"✅ Оплата заказа <b>#{order_id}</b> получена. Готовим товар.",
+            )
+        except Exception:
+            log.warning("Could not notify buyer about order %s", order_id)
+    await fulfill_paid_order(order_id, bot)
+    return "CONFIRMED"
+
+
+async def poll_pending_crypto_payments(bot):
+    """Check all unfinished Crypto Pay invoices (works without a public webhook URL)."""
+    from datetime import timedelta
+    from payments.providers.cryptobot import CryptoBotClient
+
+    async with SessionLocal() as session:
+        pending = (await session.scalars(
+            select(Payment.external_id).where(
+                Payment.provider == "cryptobot",
+                Payment.status == "PENDING",
+                Payment.external_id.is_not(None),
+                Payment.created_at > datetime.utcnow() - timedelta(days=3),
+            )
+        )).all()
+        # Orders that were paid but never claimed for fulfilment (e.g. crash between steps).
+        stuck_paid = (await session.scalars(
+            select(Order.id).where(
+                Order.status == OrderStatus.PAID.value,
+                Order.created_at < datetime.utcnow() - timedelta(minutes=2),
+            )
+        )).all()
+
+    client = CryptoBotClient()
+    for i in range(0, len(pending), 100):
+        chunk = list(pending[i:i + 100])
+        for invoice in await client.get_invoices(chunk):
+            try:
+                await process_cryptobot_invoice(invoice, bot)
+            except Exception:
+                log.exception("Crypto Pay invoice %s processing failed", invoice.get("invoice_id"))
+    for order_id in stuck_paid:
+        try:
+            await fulfill_paid_order(order_id, bot)
+        except Exception:
+            log.exception("Recovery fulfilment failed for order %s", order_id)
+
+
+async def crypto_payment_poller(bot):
+    import asyncio
+    while True:
+        try:
+            await poll_pending_crypto_payments(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Crypto Pay polling cycle failed")
+        await asyncio.sleep(max(5.0, settings.crypto_pay_poll_interval))

@@ -15,8 +15,13 @@ async def main():
     dp = create_dispatcher()
     await register_bot_commands(bot, settings.admins)
     runner = None
+    poller = None
     try:
-        if settings.platega_enabled:
+        if settings.crypto_pay_enabled:
+            from services.payment_service import crypto_payment_poller
+            poller = asyncio.create_task(crypto_payment_poller(bot))
+            logging.getLogger(__name__).info("Crypto Pay invoice poller started")
+        if settings.platega_enabled or settings.webhook_server_enabled:
             app = create_payment_app(bot)
             runner = web.AppRunner(app)
             await runner.setup()
@@ -29,6 +34,8 @@ async def main():
             )
         await dp.start_polling(bot)
     finally:
+        if poller:
+            poller.cancel()
         if runner:
             await runner.cleanup()
         await bot.session.close()
