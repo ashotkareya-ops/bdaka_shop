@@ -97,6 +97,17 @@ class CryptoBotClient:
         items = await self.get_invoices([invoice_id])
         return items[0] if items else None
 
+    async def get_rate(self, source: str, target: str) -> float:
+        rates = await self._request("getExchangeRates")
+        for item in rates or []:
+            if (
+                str(item.get("source", "")).upper() == source.upper()
+                and str(item.get("target", "")).upper() == target.upper()
+                and item.get("is_valid", True)
+            ):
+                return float(item["rate"])
+        raise CryptoBotError(f"No exchange rate {source}->{target}")
+
     async def get_me(self) -> dict:
         return await self._request("getMe")
 
@@ -117,3 +128,10 @@ class CryptoBotClient:
         if comment:
             params["comment"] = comment
         return await self._request("transfer", params)
+
+
+async def get_usd_rub_rate() -> float:
+    """1 USD (= 1 USDT) in RUB: fixed from .env if set, otherwise live from Crypto Pay."""
+    if settings.crypto_usd_rub_rate > 0:
+        return float(settings.crypto_usd_rub_rate)
+    return await CryptoBotClient().get_rate("USDT", "RUB")

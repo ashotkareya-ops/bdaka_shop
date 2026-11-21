@@ -1,8 +1,0 @@
-НАСТРОЙКА .env
-
-1. Скопируйте .env.example в файл с именем .env (без .example).
-2. Заполните BOT_TOKEN, ADMIN_IDS, DATABASE_URL, SANDROMANIA_API_KEY и SANDROMANIA_API_SECRET.
-3. Файл .env должен лежать рядом с main.py в папке bdaka_shop-main.
-4. Не отправляйте .env другим людям и не загружайте его в Git.
-
-Приложение теперь ищет .env именно в корне проекта, а не в текущей папке PowerShell.

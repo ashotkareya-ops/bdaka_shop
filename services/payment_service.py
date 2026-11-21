@@ -172,6 +172,7 @@ async def fulfill_paid_order(order_id: int, bot):
             await session.commit()
             await send_order_delivery(bot, order_id)
             await publish_purchase_notice(bot, order_id)
+            await supplier_balance_watch(bot)
         else:
             await session.commit()
             await notify_admins(bot,
@@ -217,7 +218,7 @@ async def process_cryptobot_invoice(invoice: dict, bot) -> str:
         if not payment:
             raise ValueError("Unknown Crypto Pay invoice")
         if payment.order_id is None:
-            raise ValueError("Crypto Pay top-ups are not supported")
+            return await _process_crypto_topup(session, payment, invoice, status, bot)
         order = await session.scalar(
             select(Order).where(Order.id == payment.order_id).with_for_update()
         )
@@ -311,8 +312,81 @@ async def crypto_payment_poller(bot):
     while True:
         try:
             await poll_pending_crypto_payments(bot)
+            if settings.sandromania_enabled:
+                await supplier_balance_watch(bot)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("Crypto Pay polling cycle failed")
         await asyncio.sleep(max(5.0, settings.crypto_pay_poll_interval))
+
+
+_last_balance_check = 0.0
+_last_balance_alert = 0.0
+
+
+async def supplier_balance_watch(bot, force: bool = False):
+    """Warn admins when the Sandromania balance is low. Rate-limited: checks every 30 min, alerts every 6 h."""
+    import time
+    global _last_balance_check, _last_balance_alert
+    now = time.monotonic()
+    if not force and _last_balance_check and now - _last_balance_check < 1800:
+        return
+    _last_balance_check = now
+    try:
+        balance = await SandromaniaClient().get_balance_rub()
+    except Exception:
+        log.warning("Could not read supplier balance")
+        return
+    if balance < settings.supplier_low_balance_rub and (
+        not _last_balance_alert or now - _last_balance_alert > 6 * 3600
+    ):
+        _last_balance_alert = now
+        await notify_admins(bot,
+            f"💸 Низкий баланс у Sandromania: {balance:.2f} ₽ (порог {settings.supplier_low_balance_rub:.0f} ₽). "
+            f"Пополните, иначе оплаченные заказы не смогут выполниться.")
+
+
+async def _process_crypto_topup(session, payment, invoice: dict, status: str, bot) -> str:
+    """Credit the internal balance for a paid Crypto Pay top-up invoice (exactly once)."""
+    import re
+    if status == "expired":
+        if payment.status == "PENDING":
+            payment.status = "EXPIRED"
+        await session.commit()
+        return payment.status
+    if status != "paid":
+        return payment.status
+
+    if str(invoice.get("payload") or "") != (payment.payload or ""):
+        raise ValueError("Crypto Pay payload mismatch")
+    match = re.search(r"-usd(\d+)$", payment.payload or "")
+    if not match:
+        raise ValueError("Top-up payload has no amount")
+    if str(invoice.get("currency_type") or "fiat") != "fiat" or str(invoice.get("fiat") or "").upper() != "USD":
+        raise ValueError("Crypto Pay currency mismatch")
+    try:
+        paid_usd = round(float(invoice.get("amount")), 2)
+    except (TypeError, ValueError):
+        raise ValueError("Invalid Crypto Pay amount")
+    if paid_usd != round(float(match.group(1)), 2):
+        raise ValueError("Crypto Pay amount mismatch")
+
+    if payment.status == "CONFIRMED":
+        return "CONFIRMED"
+    user = await session.scalar(select(User).where(User.id == payment.user_id).with_for_update())
+    if not user:
+        raise ValueError("User for top-up payment was not found")
+    payment.status = "CONFIRMED"
+    payment.confirmed_at = datetime.utcnow()
+    from services.balance_service import add_balance
+    await add_balance(session, user, float(payment.amount),
+                      f"Пополнение через Crypto Bot #{payment.id}", transaction_type="TOPUP")
+    await session.commit()
+    try:
+        await bot.send_message(user.telegram_id,
+            f"✅ <b>Баланс пополнен!</b>\nЗачислено: <b>{payment.amount:.2f} ₽</b>\n"
+            f"Текущий баланс: <b>{user.balance:.2f} ₽</b>")
+    except Exception:
+        log.warning("Could not notify user about top-up %s", payment.id)
+    return "CONFIRMED"

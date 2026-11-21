@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     sandromania_base_url: str = "https://api.sandromania.shop"
     sandromania_api_key: str = ""
     sandromania_api_secret: str = ""
+    # Admin-only /simulatepay for testing the fulfilment flow without a real payment. Keep OFF in production.
+    allow_test_payments: bool = Field(default=False, alias="ALLOW_TEST_PAYMENTS")
+    supplier_low_balance_rub: float = Field(default=500.0, alias="SUPPLIER_LOW_BALANCE_RUB")
     sandromania_poll_attempts: int = 8
     sandromania_poll_interval: float = 2.0
 
@@ -35,6 +38,8 @@ class Settings(BaseSettings):
     crypto_pay_testnet: bool = Field(default=False, alias="CRYPTO_PAY_TESTNET")
     # Comma-separated list, e.g. "USDT,TON,BTC". Empty = every asset enabled in your Crypto Pay app.
     crypto_pay_accepted_assets: str = Field(default="USDT,TON", alias="CRYPTO_PAY_ACCEPTED_ASSETS")
+    # Fixed USD->RUB rate for balance top-ups. 0 = use the live USDT/RUB rate from Crypto Pay.
+    crypto_usd_rub_rate: float = Field(default=0.0, alias="CRYPTO_USD_RUB_RATE")
     crypto_pay_expires_in: int = Field(default=3600, alias="CRYPTO_PAY_EXPIRES_IN")
     crypto_pay_poll_interval: float = Field(default=15.0, alias="CRYPTO_PAY_POLL_INTERVAL")
     crypto_pay_webhook_path: str = Field(

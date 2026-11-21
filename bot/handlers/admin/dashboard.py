@@ -7,6 +7,7 @@ from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy import select, text, delete, func
 from sqlalchemy.exc import IntegrityError
 import logging
+from decimal import Decimal, InvalidOperation
 from html import escape
 from config.settings import settings
 from database.models.order import Order
@@ -23,6 +24,10 @@ router = Router()
 
 class MarkupStates(StatesGroup):
     waiting_for_custom_markup = State()
+
+
+class ExchangeRateStates(StatesGroup):
+    waiting_for_usd_rub_rate = State()
 
 
 class DescriptionStates(StatesGroup):
@@ -86,6 +91,8 @@ async def _get_detailed_orders(session, page: int = 1, page_size: int = 5):
             if payment:
                 provider_names = {
                     "platega": "Platega",
+                    "cryptobot": "Crypto Pay (USD)",
+                    "telegram_stars": "Telegram Stars",
                     "manual": "Ручная оплата",
                 }
                 method = provider_names.get(
@@ -1415,3 +1422,73 @@ async def admin_orders_page_callback(callback: CallbackQuery, session):
 @router.callback_query(F.data == "admin:orders:current")
 async def admin_orders_current_callback(callback: CallbackQuery):
     await callback.answer("Текущая страница заказов")
+
+
+# ---------------------------------------------------------------------------
+# USD/RUB exchange rate (admin-managed, persisted in shop_settings)
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "admin:fx_rate")
+async def admin_fx_rate(callback: CallbackQuery, session):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    from services.exchange_rate import get_usd_rub_rate
+    rate = await get_usd_rub_rate(session)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✏️ Изменить курс", callback_data="admin:fx_rate:edit")
+    kb.button(text="⬅️ В меню администратора", callback_data="admin:home")
+    kb.adjust(1)
+    await callback.message.edit_text(
+        "<b>💱 Курс доллара для магазина</b>\n"
+        f"Текущий курс: <b>1 USD = {rate:.4f} RUB</b>\n\n"
+        "Цена товара хранится в рублях, а Crypto Pay-счёт будет выставляться в USD "
+        "по этому курсу. Изменение курса повлияет только на новые счета; уже созданные "
+        "счета сохраняют первоначальную сумму.",
+        reply_markup=kb.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:fx_rate:edit")
+async def admin_fx_rate_edit(callback: CallbackQuery, state: FSMContext):
+    if not _is_admin_callback(callback):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(ExchangeRateStates.waiting_for_usd_rub_rate)
+    await callback.message.answer(
+        "Отправь новый курс числом. Например: <code>92.50</code>\n"
+        "Это означает 1 USD = 92.50 RUB. Для отмены отправь /cancel."
+    )
+    await callback.answer()
+
+
+@router.message(ExchangeRateStates.waiting_for_usd_rub_rate, Command("cancel"))
+async def admin_fx_rate_cancel(message: Message, state: FSMContext):
+    if not is_admin(message):
+        await state.clear()
+        return
+    await state.clear()
+    await message.answer("Изменение курса отменено.")
+
+
+@router.message(ExchangeRateStates.waiting_for_usd_rub_rate)
+async def admin_fx_rate_save(message: Message, state: FSMContext, session):
+    if not is_admin(message):
+        await state.clear()
+        return
+    raw = (message.text or "").strip().replace(",", ".")
+    try:
+        rate = Decimal(raw)
+        if not rate.is_finite() or rate <= 0 or rate > Decimal("1000000"):
+            raise InvalidOperation
+    except (InvalidOperation, ValueError):
+        await message.answer("Некорректный курс. Введи положительное число, например 92.50.")
+        return
+    from services.exchange_rate import set_usd_rub_rate
+    await set_usd_rub_rate(session, rate)
+    await state.clear()
+    await message.answer(
+        f"✅ Курс обновлён: <b>1 USD = {rate:.4f} RUB</b>\n"
+        "Новые Crypto Pay-счета будут рассчитываться по этому курсу."
+    )

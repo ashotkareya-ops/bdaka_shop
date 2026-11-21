@@ -8,3 +8,5 @@ from database.models.promo import PromoCode
 from database.models.referral import Referral
 from database.models.supplier import Supplier
 from database.models.digital_key import DigitalKey
+
+from database.models.shop_setting import ShopSetting

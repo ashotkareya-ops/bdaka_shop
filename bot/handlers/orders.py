@@ -84,10 +84,7 @@ async def buy_product(callback: CallbackQuery, session):
         )
         return
     if method == "balance":
-        await callback.answer(
-            "Оплата цифровых товаров внутри Telegram проводится через Telegram Stars.",
-            show_alert=True,
-        )
+        await create_balance_order(callback, session, product_id)
         return
     await callback.answer("Неизвестный способ оплаты", show_alert=True)
     return
@@ -240,6 +237,9 @@ async def create_stars_order(callback: CallbackQuery, session, product_id: int):
         ):
             await callback.answer("Товар закончился.", show_alert=True)
             return
+
+    if use_supplier and not await _supplier_ready(callback, product):
+        return
 
     stars = _stars_for_rubles(product.price)
     order = Order(
@@ -540,6 +540,9 @@ async def create_crypto_order(callback: CallbackQuery, session, product_id: int)
             await callback.answer("Товар закончился.", show_alert=True)
             return
 
+    if use_supplier and not await _supplier_ready(callback, product):
+        return
+
     order = Order(
         user_id=user.id, product_id=product.id, price=product.price,
         status=OrderStatus.PENDING.value,
@@ -588,3 +591,77 @@ async def create_crypto_order(callback: CallbackQuery, session, product_id: int)
         reply_markup=invoice_keyboard(str(pay_url), order.id),
     )
     await callback.answer("Счёт создан")
+
+
+async def _supplier_ready(callback: CallbackQuery, product) -> bool:
+    """Do not take money for a product the supplier balance cannot cover."""
+    from services.supplier_sync import supplier_can_afford
+    from services.payment_service import supplier_balance_watch
+    try:
+        ok = await supplier_can_afford(product)
+    except Exception:
+        log.exception("Supplier balance check failed for product_id=%s", product.id)
+        await callback.answer("Не удалось проверить доступность товара. Попробуйте позже.", show_alert=True)
+        return False
+    if not ok:
+        log.warning("Supplier balance too low for product_id=%s", product.id)
+        await supplier_balance_watch(callback.bot, force=True)
+        await callback.answer("Товар временно недоступен. Попробуйте позже.", show_alert=True)
+        return False
+    return True
+
+
+async def create_balance_order(callback: CallbackQuery, session, product_id: int):
+    """Pay for a product from the internal balance, then run the normal fulfilment."""
+    user = await session.scalar(
+        select(User).where(User.telegram_id == callback.from_user.id).with_for_update()
+    )
+    product = await session.get(Product, product_id)
+    if not user or not product or not product.is_active or product.price <= 0:
+        await callback.answer("Не удалось оформить заказ", show_alert=True)
+        return
+    key = await session.scalar(
+        select(DigitalKey).where(
+            DigitalKey.product_id == product.id, DigitalKey.status == "AVAILABLE"
+        ).with_for_update(skip_locked=True).limit(1)
+    )
+    use_supplier = key is None and product.supplier_name == "sandromania" and product.supplier_product_id
+    if key is None and not use_supplier:
+        await callback.answer("Товар временно отсутствует", show_alert=True)
+        return
+    if use_supplier:
+        if not settings.sandromania_enabled:
+            await callback.answer("Интеграция поставщика не настроена", show_alert=True)
+            return
+        try:
+            from services.supplier_sync import refresh_supplier_product_stock
+            live_item = await refresh_supplier_product_stock(session, product)
+        except Exception:
+            log.exception("Supplier stock check failed for product_id=%s", product.id)
+            await callback.answer("Не удалось проверить наличие. Попробуйте позже.", show_alert=True)
+            return
+        if live_item is None or not product.supplier_available or not product.supplier_stock or product.supplier_stock <= 0:
+            await callback.answer("Товар закончился.", show_alert=True)
+            return
+        if not await _supplier_ready(callback, product):
+            return
+    if round(float(user.balance), 2) < round(float(product.price), 2):
+        await callback.answer("Недостаточно средств на балансе. Пополните баланс в профиле.", show_alert=True)
+        return
+
+    order = Order(
+        user_id=user.id, product_id=product.id, price=product.price,
+        status=OrderStatus.PAID.value,
+        idempotency_key=secrets.token_urlsafe(24) if use_supplier else None,
+    )
+    user.balance -= product.price
+    session.add(order)
+    await session.flush()
+    session.add(Transaction(
+        user_id=user.id, amount=-product.price, type="PURCHASE",
+        description=f"Покупка #{order.id}: {product.name}",
+    ))
+    await session.commit()
+    await callback.answer("Оплачено с баланса")
+    from services.payment_service import fulfill_paid_order
+    await fulfill_paid_order(order.id, callback.bot)

@@ -7,6 +7,7 @@ def payment_method_keyboard(product_id: int):
     kb.button(text="⭐ Оплатить Telegram Stars", callback_data=f"buy:stars:{product_id}")
     if settings.crypto_pay_enabled:
         kb.button(text="🪙 Оплатить криптой (Crypto Bot)", callback_data=f"buy:crypto:{product_id}")
+    kb.button(text="💰 Оплатить с баланса", callback_data=f"buy:balance:{product_id}")
     kb.button(text="⬅️ Назад к товару", callback_data=f"product:{product_id}")
     kb.button(text="🏠 Вернуться в главное меню", callback_data="menu:home")
     kb.adjust(1)
@@ -33,6 +34,8 @@ def insufficient_balance_keyboard():
 def topup_method_keyboard():
     kb = InlineKeyboardBuilder()
     kb.button(text="⭐ Telegram Stars", callback_data="balance:method:stars")
+    if settings.crypto_pay_enabled:
+        kb.button(text="🪙 Crypto Bot (USDT)", callback_data="balance:method:crypto")
     kb.button(text="⬅️ В профиль", callback_data="balance:profile")
     kb.button(text="🏠 Вернуться в главное меню", callback_data="menu:home")
     kb.adjust(1)
@@ -58,4 +61,16 @@ def topup_invoice_keyboard(payment_url: str, payment_id: int):
     kb.button(text="👤 В профиль", callback_data="balance:profile")
     kb.button(text="🏠 Вернуться в главное меню", callback_data="menu:home")
     kb.adjust(1)
+    return kb.as_markup()
+
+
+def topup_crypto_amount_keyboard():
+    kb = InlineKeyboardBuilder()
+    for amount in (1, 3, 5, 10):
+        kb.button(text=f"💵 {amount} $", callback_data=f"balance:cryptousd:{amount}")
+    kb.button(text="✍️ Ввести сумму в $", callback_data="balance:cryptoenter")
+    kb.button(text="⬅️ К способам оплаты", callback_data="balance:topup")
+    kb.button(text="👤 В профиль", callback_data="balance:profile")
+    kb.button(text="🏠 Главное меню", callback_data="menu:home")
+    kb.adjust(2, 2, 1, 1, 1, 1)
     return kb.as_markup()
