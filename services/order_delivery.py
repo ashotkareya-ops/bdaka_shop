@@ -28,7 +28,7 @@ def _receipt_text(order, product):
         f"🧾 <b>Заказ #{order.id}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📦 <b>Товар:</b> {product.name}\n"
-        f"🔢 <b>Количество:</b> 1\n"
+        f"🔢 <b>Количество:</b> {order.quantity or 1}\n"
         f"💰 <b>Сумма:</b> {order.price:.2f} ₽\n"
         f"📊 <b>Статус:</b> ✅ Выполнен\n"
         f"🕒 <b>Дата:</b> {_date_text(order.created_at)}"
@@ -61,25 +61,23 @@ async def send_order_delivery(bot, order_id: int):
         if not result:
             return False
         order, product, user = result
-        key = await session.scalar(
-            select(DigitalKey).where(DigitalKey.order_id == order.id)
-        )
-        if not key or not key.code:
+        keys = (await session.scalars(
+            select(DigitalKey).where(DigitalKey.order_id == order.id).order_by(DigitalKey.id)
+        )).all()
+        if not keys or any(not key.code for key in keys):
             return False
-        delivery = key.code
+        deliveries = [key.code for key in keys]
+        delivery = deliveries[0]
         receipt = _receipt_text(order, product)
-        is_link = _is_url(delivery)
-        intro = (
-            "🔑 <b>Ссылки / коды по заказу "
-            f"#{order.id}</b>\n\n"
-            "Откройте ссылку активации. Если выдан отдельный код, "
-            "скопируйте его и вставьте на странице активации.\n\n"
-            if is_link else
-            "🔑 <b>Данные для активации по заказу "
-            f"#{order.id}</b>\n\n"
-            "Скопируйте код и следуйте инструкции продавца.\n\n"
-        )
-        delivery_text = intro + (delivery if is_link else f"<code>{delivery}</code>")
+        is_link = all(_is_url(item) for item in deliveries)
+        intro = ("🔑 <b>Данные по заказу " f"#{order.id}</b>\n\n")
+        if len(deliveries) > 1:
+            delivery_text = intro + "\n".join(
+                f"{index}. " + (item if _is_url(item) else f"<code>{escape(item)}</code>")
+                for index, item in enumerate(deliveries, 1)
+            )
+        else:
+            delivery_text = intro + (delivery if is_link else f"<code>{escape(delivery)}</code>")
         keyboard = _delivery_keyboard(order.id, delivery)
         telegram_id = user.telegram_id
 
@@ -100,18 +98,18 @@ async def send_order_txt(bot, order_id: int, telegram_id: int):
         if not result:
             return False
         order, product, user = result
-        key = await session.scalar(select(DigitalKey).where(DigitalKey.order_id == order.id))
-        if not key or not key.code:
+        keys = (await session.scalars(select(DigitalKey).where(DigitalKey.order_id == order.id).order_by(DigitalKey.id))).all()
+        if not keys or any(not key.code for key in keys):
             return False
         content = (
             f"Заказ #{order.id}\n"
             f"Товар: {product.name}\n"
             f"Описание: {product.description or 'не указано'}\n"
-            f"Количество: 1\n"
+            f"Количество: {order.quantity or 1}\n"
             f"Сумма: {order.price:.2f} RUB\n"
             f"Статус: Выполнен\n"
             f"Дата: {_date_text(order.created_at)}\n\n"
-            f"Код / ссылка активации:\n{key.code}\n"
+            f"Коды / ссылки активации:\n" + "\n".join(key.code for key in keys) + "\n"
         )
         filename = f"order_{order.id}.txt"
     document = BufferedInputFile(content.encode("utf-8"), filename=filename)

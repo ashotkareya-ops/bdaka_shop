@@ -673,8 +673,31 @@ async def clear_product_description(message: Message, state: FSMContext, session
         return
     product.description = ""
     await session.commit()
+    await _refresh_description_menu(message.bot, data, session)
     await state.clear()
     await message.answer(f"Описание товара «{product.name}» очищено.")
+
+
+async def _refresh_description_menu(bot, state_data, session):
+    chat_id = state_data.get("description_menu_chat_id")
+    message_id = state_data.get("description_menu_message_id")
+    if not chat_id or not message_id:
+        return
+    rows = (await session.scalars(select(Product).order_by(Product.name).limit(50))).all()
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    for item in rows:
+        status = "есть описание" if (item.description or "").strip() else "без описания"
+        kb.button(text=f"{item.name[:42]} · {status}", callback_data=f"admin:description:edit:{item.id}")
+    kb.button(text="⬅️ В меню", callback_data="admin:home")
+    kb.adjust(1)
+    try:
+        await bot.edit_message_text(
+            "<b>📝 Описания товаров</b>\nВыбери товар, описание которого нужно добавить или изменить:",
+            chat_id=chat_id, message_id=message_id, reply_markup=kb.as_markup(),
+        )
+    except Exception:
+        pass
 
 
 @router.message(DescriptionStates.waiting_for_description)
@@ -697,6 +720,7 @@ async def save_product_description(message: Message, state: FSMContext, session)
         return
     product.description = description
     await session.commit()
+    await _refresh_description_menu(message.bot, data, session)
     await state.clear()
     await message.answer(
         f"✅ Описание сохранено для товара «{product.name}».\n"
@@ -981,7 +1005,11 @@ async def admin_description_edit(callback: CallbackQuery, state: FSMContext, ses
         await callback.answer("Товар не найден", show_alert=True)
         return
     await state.set_state(DescriptionStates.waiting_for_description)
-    await state.update_data(description_product_id=product.id)
+    await state.update_data(
+        description_product_id=product.id,
+        description_menu_chat_id=callback.message.chat.id,
+        description_menu_message_id=callback.message.message_id,
+    )
     await callback.message.answer(
         f"📝 <b>{product.name}</b>\n"
         "Отправь новое описание следующим сообщением. Можно использовать эмодзи и переносы строк.\n"

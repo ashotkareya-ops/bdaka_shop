@@ -115,13 +115,13 @@ async def copy_order_delivery(callback: CallbackQuery, session):
     if not order or order.status != "COMPLETED":
         await callback.answer("Заказ не найден или ещё не выполнен", show_alert=True)
         return
-    key = await session.scalar(select(DigitalKey).where(DigitalKey.order_id == order_id))
-    if not key or not key.code:
+    keys = (await session.scalars(select(DigitalKey).where(DigitalKey.order_id == order_id).order_by(DigitalKey.id))).all()
+    if not keys or any(not key.code for key in keys):
         await callback.answer("Данные заказа не найдены", show_alert=True)
         return
+    codes = "\n".join(f"{index}. <code>{escape(key.code)}</code>" for index, key in enumerate(keys, 1))
     await callback.message.answer(
-        f"📋 <b>Данные для копирования · заказ #{order_id}</b>\n\n"
-        f"<code>{escape(key.code)}</code>",
+        f"📋 <b>Данные для копирования · заказ #{order_id}</b>\n\n{codes}",
         disable_web_page_preview=True,
     )
     await callback.answer("Отправил данные отдельным сообщением")

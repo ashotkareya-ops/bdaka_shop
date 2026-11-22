@@ -113,19 +113,28 @@ async def fulfill_paid_order(order_id: int, bot):
         if not product or not user:
             log.error("Paid order %s missing product or user", order_id)
             return
-        key = await session.scalar(
+        keys = (await session.scalars(
             select(DigitalKey).where(
                 DigitalKey.product_id == product.id, DigitalKey.status == "AVAILABLE"
-            ).with_for_update(skip_locked=True).limit(1)
-        )
-        if key:
-            key.status = "SOLD"
-            key.order_id = order.id
+            ).with_for_update(skip_locked=True).limit(order.quantity or 1)
+        )).all()
+        if len(keys) >= (order.quantity or 1):
+            for key in keys:
+                key.status = "SOLD"
+                key.order_id = order.id
             order.status = OrderStatus.COMPLETED.value
             user.purchase_count += 1
             await session.commit()
             await send_order_delivery(bot, order.id)
             await publish_purchase_notice(bot, order.id)
+            return
+
+        if keys:
+            # Do not partially fulfil a paid order. Keep it for manual reconciliation.
+            order.status = OrderStatus.PROCESSING.value
+            await session.commit()
+            await notify_admins(bot, f"⚠️ Заказ #{order.id}: запрошено {order.quantity} шт., локально найдено {len(keys)}. Требуется проверка остатка.")
+            await bot.send_message(user.telegram_id, f"Оплата заказа #{order.id} подтверждена. Проверяем наличие полного количества товара.")
             return
 
         if product.supplier_name != "sandromania" or not product.supplier_product_id:
@@ -145,7 +154,7 @@ async def fulfill_paid_order(order_id: int, bot):
         telegram_id = user.telegram_id
 
     try:
-        result = await SandromaniaClient().purchase_and_wait(supplier_id, idem)
+        result = await SandromaniaClient().purchase_and_wait(supplier_id, idem, order.quantity or 1)
     except Exception:
         log.exception("Supplier fulfilment failed/uncertain for paid order %s", order_id)
         await notify_admins(bot,
@@ -161,10 +170,11 @@ async def fulfill_paid_order(order_id: int, bot):
         if not order or order.status != OrderStatus.PROCESSING.value:
             return
         order.supplier_order_id = result.get("order_id")
-        delivery = result.get("delivery") or result.get("code")
-        if delivery:
-            session.add(DigitalKey(product_id=order.product_id, order_id=order.id,
-                                   code=delivery, status="SOLD"))
+        deliveries = result.get("deliveries") or ([result.get("delivery") or result.get("code")] if (result.get("delivery") or result.get("code")) else [])
+        if len(deliveries) >= (order.quantity or 1):
+            for delivery in deliveries[:(order.quantity or 1)]:
+                session.add(DigitalKey(product_id=order.product_id, order_id=order.id,
+                                       code=delivery, status="SOLD"))
             order.status = OrderStatus.COMPLETED.value
             user = await session.get(User, order.user_id)
             if user:

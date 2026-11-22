@@ -1,7 +1,9 @@
 import secrets
 import logging
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, PreCheckoutQuery, LabeledPrice
+from aiogram.types import CallbackQuery, PreCheckoutQuery, LabeledPrice, Message
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy import select
 from database.models.user import User
 from database.models.product import Product
@@ -14,12 +16,17 @@ from services.order_delivery import send_order_delivery
 from services.review_publisher import publish_purchase_notice
 from suppliers.sandromania.client import SandromaniaClient, SandromaniaAPIError
 from bot.keyboards.payments import payment_method_keyboard, invoice_keyboard
+from bot.keyboards.products import quantity_keyboard
 import math
 from datetime import datetime
 from database.models.payment import Payment
 from payments.providers.platega import PlategaClient, PlategaError
 
 router = Router()
+
+class QuantityStates(StatesGroup):
+    waiting_for_quantity = State()
+
 RUB_PER_STAR = 0.95
 
 
@@ -30,7 +37,7 @@ def _stars_for_rubles(amount_rub: float) -> int:
 log = logging.getLogger(__name__)
 
 @router.callback_query(F.data.startswith("buy:"))
-async def buy_product(callback: CallbackQuery, session):
+async def buy_product(callback: CallbackQuery, session, state: FSMContext):
     parts = callback.data.split(":")
     if len(parts) == 2:
         try:
@@ -42,186 +49,132 @@ async def buy_product(callback: CallbackQuery, session):
         if not product or not product.is_active:
             await callback.answer("Товар недоступен", show_alert=True)
             return
-        # Replace the long product description with a compact checkout summary.
-        checkout_text = (
-            "🛒 <b>Расчёт заказа</b>\n"
-            f"Товар: <b>{product.name}</b>\n"
-            "🟢 Количество: 1\n"
-            f"💰 Товар: <b>{product.price:.2f} ₽</b>\n"
-            "<i>Выберите способ оплаты. </i>"
-        )
-        if callback.message.photo:
-            await callback.message.edit_caption(
-                caption=checkout_text,
-                reply_markup=payment_method_keyboard(product_id),
-            )
-        else:
-            await callback.message.edit_text(
-                checkout_text,
-                reply_markup=payment_method_keyboard(product_id),
-            )
+        local_stock = await session.scalar(select(__import__('sqlalchemy').func.count(DigitalKey.id)).where(
+            DigitalKey.product_id == product_id, DigitalKey.status == "AVAILABLE")) or 0
+        max_quantity = local_stock
+        if product.supplier_name == "sandromania" and product.supplier_available:
+            max_quantity = max_quantity if max_quantity > 0 else int(product.supplier_stock or 0)
+        if max_quantity <= 0:
+            await callback.answer("Товар временно отсутствует", show_alert=True)
+            return
+        max_quantity = min(max_quantity, 100)
+        text = (f"🛒 <b>Выбор количества</b>\nТовар: <b>{product.name}</b>\n"
+                f"Цена за 1 шт.: <b>{product.price:.2f} ₽</b>\n"
+                f"Доступно: <b>{max_quantity} шт.</b>\n\n"
+                f"Выберите количество кнопками или нажмите на число для ручного ввода.\n"
+                f"Итого: <b>{product.price:.2f} ₽</b>")
+        await callback.message.edit_caption(caption=text, reply_markup=quantity_keyboard(product_id, 1, max_quantity)) if callback.message.photo else await callback.message.edit_text(text, reply_markup=quantity_keyboard(product_id, 1, max_quantity))
+        await state.clear()
         await callback.answer()
         return
-    if len(parts) != 3:
+    if len(parts) != 4:
         await callback.answer("Некорректный запрос", show_alert=True)
         return
-    method, raw_product_id = parts[1], parts[2]
+    method, raw_product_id, raw_quantity = parts[1], parts[2], parts[3]
     try:
-        product_id = int(raw_product_id)
+        product_id, quantity = int(raw_product_id), int(raw_quantity)
     except ValueError:
-        await callback.answer("Некорректный товар", show_alert=True)
+        await callback.answer("Некорректный товар или количество", show_alert=True)
+        return
+    if not 1 <= quantity <= 100:
+        await callback.answer("Можно заказать от 1 до 100 штук за один заказ", show_alert=True)
         return
     if method == "stars":
-        await create_stars_order(callback, session, product_id)
-        return
-    if method == "crypto":
-        await create_crypto_order(callback, session, product_id)
-        return
-    if method == "platega":
-        await callback.answer(
-            "Для цифровых товаров внутри Telegram доступна оплата только Telegram Stars.",
-            show_alert=True,
-        )
-        return
-    if method == "balance":
-        await create_balance_order(callback, session, product_id)
-        return
-    await callback.answer("Неизвестный способ оплаты", show_alert=True)
-    return
-    user = await session.scalar(
-        select(User).where(User.telegram_id == callback.from_user.id).with_for_update()
-    )
+        await create_stars_order(callback, session, product_id, quantity)
+    elif method == "crypto":
+        await create_crypto_order(callback, session, product_id, quantity)
+    elif method == "platega":
+        await create_platega_order(callback, session, product_id, quantity)
+    elif method == "balance":
+        await create_balance_order(callback, session, product_id, quantity)
+    else:
+        await callback.answer("Неизвестный способ оплаты", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("qty:change:"))
+async def change_quantity(callback: CallbackQuery, session):
+    _, _, raw_id, raw_qty = callback.data.split(":")
+    product_id, quantity = int(raw_id), int(raw_qty)
     product = await session.get(Product, product_id)
-    if not user:
-        log.warning(
-            "Checkout rejected: reason=user_not_found telegram_id=%s product_id=%s",
-            callback.from_user.id, product_id,
-        )
-        await callback.answer("Профиль покупателя не найден. Отправьте /start и повторите попытку.", show_alert=True)
-        return
     if not product:
-        log.warning(
-            "Checkout rejected: reason=product_not_found telegram_id=%s product_id=%s",
-            callback.from_user.id, product_id,
-        )
-        await callback.answer("Товар не найден. Обновите каталог.", show_alert=True)
-        return
-    if not product.is_active:
-        log.warning(
-            "Checkout rejected: reason=product_inactive telegram_id=%s product_id=%s",
-            callback.from_user.id, product_id,
-        )
-        await callback.answer("Этот товар временно недоступен.", show_alert=True)
-        return
-    if product.price is None or float(product.price) <= 0:
-        log.warning(
-            "Checkout rejected: reason=invalid_price telegram_id=%s product_id=%s price=%s",
-            callback.from_user.id, product_id, product.price,
-        )
-        await callback.answer("У товара некорректная цена. Обратитесь в поддержку.", show_alert=True)
-        return
+        await callback.answer("Товар не найден", show_alert=True); return
+    local_stock = await session.scalar(select(__import__('sqlalchemy').func.count(DigitalKey.id)).where(
+        DigitalKey.product_id == product_id, DigitalKey.status == "AVAILABLE")) or 0
+    max_quantity = local_stock
+    if product.supplier_name == "sandromania" and product.supplier_available:
+        max_quantity = max_quantity if max_quantity > 0 else int(product.supplier_stock or 0)
+    max_quantity = min(max_quantity, 100)
+    quantity = max(1, min(quantity, max_quantity))
+    text = (f"🛒 <b>Выбор количества</b>\nТовар: <b>{product.name}</b>\n"
+            f"Цена за 1 шт.: <b>{product.price:.2f} ₽</b>\nДоступно: <b>{max_quantity} шт.</b>\n\n"
+            f"Количество: <b>{quantity}</b>\nИтого: <b>{product.price * quantity:.2f} ₽</b>")
+    if callback.message.photo:
+        await callback.message.edit_caption(caption=text, reply_markup=quantity_keyboard(product_id, quantity, max_quantity))
+    else:
+        await callback.message.edit_text(text, reply_markup=quantity_keyboard(product_id, quantity, max_quantity))
+    await callback.answer()
 
-    key = await session.scalar(
-        select(DigitalKey).where(
-            DigitalKey.product_id == product.id,
-            DigitalKey.status == "AVAILABLE"
-        ).with_for_update(skip_locked=True).limit(1)
-    )
 
-    # Supplier fallback is enabled only when product has an explicit supplier mapping.
-    use_supplier = key is None and product.supplier_name == "sandromania" and product.supplier_product_id
-    if key is None and not use_supplier:
-        await callback.answer("Товар временно отсутствует", show_alert=True)
-        return
-    if use_supplier and not settings.sandromania_enabled:
-        await callback.answer("Интеграция поставщика не настроена", show_alert=True)
-        return
-    if use_supplier:
-        try:
-            from services.supplier_sync import refresh_supplier_product_stock
-            live_item = await refresh_supplier_product_stock(session, product)
-        except Exception:
-            log.exception("Could not refresh supplier stock for product_id=%s", product.id)
-            await callback.answer(
-                "Не удалось проверить наличие у продавца. Попробуйте немного позже.",
-                show_alert=True,
-            )
-            return
-        if (
-            live_item is None
-            or not product.supplier_available
-            or product.supplier_stock is None
-            or product.supplier_stock <= 0
-        ):
-            await callback.answer("Товар закончился.", show_alert=True)
-            return
-    if user.balance < product.price:
-        await callback.answer("Недостаточно средств на балансе", show_alert=True)
-        return
+@router.callback_query(F.data.startswith("qty:custom:"))
+async def request_custom_quantity(callback: CallbackQuery, state: FSMContext):
+    product_id = int(callback.data.split(":")[2])
+    await state.update_data(quantity_product_id=product_id)
+    await state.set_state(QuantityStates.waiting_for_quantity)
+    await callback.message.answer("Введите нужное количество числом (от 1 до 100).")
+    await callback.answer()
 
-    order = Order(
-        user_id=user.id, product_id=product.id, price=product.price,
-        status=OrderStatus.PROCESSING.value if use_supplier else OrderStatus.COMPLETED.value,
-        idempotency_key=secrets.token_urlsafe(24) if use_supplier else None
-    )
-    user.balance -= product.price
-    session.add(order)
-    session.add(Transaction(
-        user_id=user.id, amount=-product.price, type="PURCHASE",
-        description=f"Покупка: {product.name}"
-    ))
-    if key:
-        key.status = "SOLD"
-        key.order = order
-        order.status = OrderStatus.COMPLETED.value
-        await session.commit()
-        await send_order_delivery(callback.bot, order.id)
-        await publish_purchase_notice(callback.bot, order.id)
-        await callback.answer("Заказ выполнен")
-        return
 
-    await session.commit()  # persist order and stable idempotency key before external call
+@router.message(QuantityStates.waiting_for_quantity)
+async def save_custom_quantity(message: Message, state: FSMContext, session):
     try:
-        result = await SandromaniaClient().purchase_and_wait(
-            int(product.supplier_product_id), order.idempotency_key
-        )
-        order.supplier_order_id = result.get("order_id")
-        delivery = result.get("delivery") or result.get("code")
-        if delivery:
-            session.add(DigitalKey(
-                product_id=product.id, order_id=order.id,
-                code=delivery, status="SOLD"
-            ))
-            order.status = OrderStatus.COMPLETED.value
-            if product.supplier_stock is not None and product.supplier_stock > 0:
-                product.supplier_stock -= 1
-            await session.commit()
-            await send_order_delivery(callback.bot, order.id)
-            await publish_purchase_notice(callback.bot, order.id)
-        else:
-            order.status = OrderStatus.PROCESSING.value
-            await session.commit()
-            await callback.message.answer(
-                f"⏳ Заказ #{order.id} принят поставщиком и обрабатывается. "
-                "Код будет выдан после подтверждения результата. Обратитесь в поддержку, если ожидание затянулось."
-            )
-        await callback.answer("Заказ отправлен поставщику")
-    except Exception:
-        log.exception("Sandromania purchase result is uncertain for local order %s", order.id)
-        # A timeout/5xx can happen after the supplier has accepted the purchase.
-        # Keep the same idempotency key and do NOT auto-refund or retry with a new key.
-        # Reconcile this order with the supplier before refunding or attempting another purchase.
-        order.status = OrderStatus.PROCESSING.value
-        await session.commit()
-        await callback.message.answer(
-            f"⏳ Не удалось однозначно получить результат закупки. "
-            f"Заказ #{order.id} сохранён для проверки; средства пока удерживаются, "
-            "чтобы не допустить двойной покупки. Поддержка проверит статус."
-        )
-        await callback.answer("Заказ требует проверки", show_alert=True)
+        quantity = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Введите целое число от 1 до 100.")
+        return
+    if not 1 <= quantity <= 100:
+        await message.answer("Количество должно быть от 1 до 100.")
+        return
+    data = await state.get_data()
+    product_id = int(data["quantity_product_id"])
+    product = await session.get(Product, product_id)
+    if not product:
+        await state.clear(); await message.answer("Товар не найден."); return
+    local_stock = await session.scalar(select(__import__('sqlalchemy').func.count(DigitalKey.id)).where(
+        DigitalKey.product_id == product_id, DigitalKey.status == "AVAILABLE")) or 0
+    max_quantity = local_stock
+    if product.supplier_name == "sandromania" and product.supplier_available:
+        max_quantity = max_quantity if max_quantity > 0 else int(product.supplier_stock or 0)
+    max_quantity = min(max_quantity, 100)
+    if quantity > max_quantity:
+        await message.answer(f"Сейчас доступно только {max_quantity} шт. Введите меньшее количество.")
+        return
+    await state.clear()
+    text = (f"🛒 <b>Выбор количества</b>\nТовар: <b>{product.name}</b>\n"
+            f"Цена за 1 шт.: <b>{product.price:.2f} ₽</b>\nКоличество: <b>{quantity}</b>\n"
+            f"Итого: <b>{product.price * quantity:.2f} ₽</b>")
+    from bot.keyboards.products import quantity_keyboard
+    await message.answer(text, reply_markup=quantity_keyboard(product_id, quantity, max_quantity), parse_mode="HTML")
 
 
-async def create_stars_order(callback: CallbackQuery, session, product_id: int):
+@router.callback_query(F.data.startswith("qty:confirm:"))
+async def confirm_quantity(callback: CallbackQuery, session):
+    _, _, raw_id, raw_qty = callback.data.split(":")
+    product_id, quantity = int(raw_id), int(raw_qty)
+    product = await session.get(Product, product_id)
+    if not product or not product.is_active:
+        await callback.answer("Товар недоступен", show_alert=True); return
+    total = float(product.price) * quantity
+    text = (f"🛒 <b>Расчёт заказа</b>\nТовар: <b>{product.name}</b>\n"
+            f"🔢 Количество: <b>{quantity}</b>\nЦена за штуку: {product.price:.2f} ₽\n"
+            f"💰 Итого: <b>{total:.2f} ₽</b>\n\nВыберите способ оплаты.")
+    if callback.message.photo:
+        await callback.message.edit_caption(caption=text, reply_markup=payment_method_keyboard(product_id, quantity))
+    else:
+        await callback.message.edit_text(text, reply_markup=payment_method_keyboard(product_id, quantity))
+    await callback.answer()
+
+
+async def create_stars_order(callback: CallbackQuery, session, product_id: int, quantity: int = 1):
     log.info(
         "Checkout callback received: method=stars telegram_id=%s product_id=%s",
         callback.from_user.id, product_id,
@@ -260,6 +213,14 @@ async def create_stars_order(callback: CallbackQuery, session, product_id: int):
         await callback.answer("У товара некорректная цена. Обратитесь в поддержку.", show_alert=True)
         return
 
+    local_count = await session.scalar(
+        select(__import__('sqlalchemy').func.count(DigitalKey.id)).where(
+            DigitalKey.product_id == product.id, DigitalKey.status == "AVAILABLE"
+        )
+    ) or 0
+    if 0 < local_count < quantity:
+        await callback.answer(f"На складе доступно только {local_count} шт.", show_alert=True)
+        return
     key = await session.scalar(
         select(DigitalKey).where(
             DigitalKey.product_id == product.id,
@@ -271,7 +232,7 @@ async def create_stars_order(callback: CallbackQuery, session, product_id: int):
         and product.supplier_name == "sandromania"
         and product.supplier_product_id
     )
-    if key is None and not use_supplier:
+    if local_count < quantity and not use_supplier:
         await callback.answer("Товар временно отсутствует", show_alert=True)
         return
     if use_supplier:
@@ -287,16 +248,17 @@ async def create_stars_order(callback: CallbackQuery, session, product_id: int):
             return
         if (
             live_item is None or not product.supplier_available
-            or not product.supplier_stock or product.supplier_stock <= 0
+            or not product.supplier_stock or product.supplier_stock < quantity
         ):
             await callback.answer("Товар закончился.", show_alert=True)
             return
 
-    stars = _stars_for_rubles(product.price)
+    total_price = float(product.price) * quantity
+    stars = _stars_for_rubles(total_price)
     order = Order(
         user_id=user.id,
         product_id=product.id,
-        price=product.price,
+        price=total_price, quantity=quantity,
         status=OrderStatus.PENDING.value,
         idempotency_key=secrets.token_urlsafe(24) if use_supplier else None,
     )
@@ -305,7 +267,7 @@ async def create_stars_order(callback: CallbackQuery, session, product_id: int):
     payment = Payment(
         user_id=user.id,
         order_id=order.id,
-        amount=float(product.price),
+        amount=total_price,
         provider="telegram_stars",
         status="PENDING",
         payload=f"stars-order-{order.id}",
@@ -319,7 +281,7 @@ async def create_stars_order(callback: CallbackQuery, session, product_id: int):
             description=f"BDAKA SHOP — заказ #{order.id}",
             payload=payment.payload,
             currency="XTR",
-            prices=[LabeledPrice(label=product.name[:32], amount=stars)],
+            prices=[LabeledPrice(label=f"{product.name[:22]} x{quantity}"[:32], amount=stars)],
         )
     except Exception:
         log.exception("Could not send Stars invoice for order_id=%s", order.id)
@@ -405,7 +367,7 @@ async def confirm_stars_order(message, session):
     await fulfill_paid_order(order.id, message.bot)
 
 
-async def create_platega_order(callback: CallbackQuery, session, product_id: int):
+async def create_platega_order(callback: CallbackQuery, session, product_id: int, quantity: int = 1):
     log.info(
         "Checkout callback received: method=platega telegram_id=%s product_id=%s",
         callback.from_user.id, product_id,
@@ -443,13 +405,21 @@ async def create_platega_order(callback: CallbackQuery, session, product_id: int
         await callback.answer("У товара некорректная цена. Обратитесь в поддержку.", show_alert=True)
         return
 
+    local_count = await session.scalar(
+        select(__import__('sqlalchemy').func.count(DigitalKey.id)).where(
+            DigitalKey.product_id == product.id, DigitalKey.status == "AVAILABLE"
+        )
+    ) or 0
+    if 0 < local_count < quantity:
+        await callback.answer(f"На складе доступно только {local_count} шт.", show_alert=True)
+        return
     key = await session.scalar(
         select(DigitalKey).where(
             DigitalKey.product_id == product.id, DigitalKey.status == "AVAILABLE"
         ).with_for_update(skip_locked=True).limit(1)
     )
-    use_supplier = key is None and product.supplier_name == "sandromania" and product.supplier_product_id
-    if key is None and not use_supplier:
+    use_supplier = local_count == 0 and product.supplier_name == "sandromania" and product.supplier_product_id
+    if local_count < quantity and not use_supplier:
         await callback.answer("Товар временно отсутствует", show_alert=True)
         return
     if use_supplier:
@@ -463,7 +433,7 @@ async def create_platega_order(callback: CallbackQuery, session, product_id: int
             log.exception("Supplier stock check failed for product_id=%s", product.id)
             await callback.answer("Не удалось проверить наличие. Попробуйте позже.", show_alert=True)
             return
-        if live_item is None or not product.supplier_available or not product.supplier_stock or product.supplier_stock <= 0:
+        if live_item is None or not product.supplier_available or not product.supplier_stock or product.supplier_stock < quantity:
             await callback.answer("Товар закончился.", show_alert=True)
             return
 
@@ -471,15 +441,16 @@ async def create_platega_order(callback: CallbackQuery, session, product_id: int
         await callback.answer("Оплата Platega пока не настроена", show_alert=True)
         return
 
+    total_price = float(product.price) * quantity
     order = Order(
-        user_id=user.id, product_id=product.id, price=product.price,
+        user_id=user.id, product_id=product.id, price=total_price, quantity=quantity,
         status=OrderStatus.PENDING.value,
         idempotency_key=secrets.token_urlsafe(24) if use_supplier else None,
     )
     session.add(order)
     await session.flush()
     payment = Payment(
-        user_id=user.id, order_id=order.id, amount=product.price,
+        user_id=user.id, order_id=order.id, amount=total_price,
         provider="platega", status="CREATING", payload=f"order-{order.id}",
     )
     session.add(payment)
@@ -487,7 +458,7 @@ async def create_platega_order(callback: CallbackQuery, session, product_id: int
 
     try:
         invoice = await PlategaClient().create_invoice(
-            amount=product.price, currency=settings.currency,
+            amount=total_price, currency=settings.currency,
             payload=f"order-{order.id}", description=f"BDAKA SHOP — заказ #{order.id}",
         )
         payment.external_id = invoice["external_id"]
@@ -581,7 +552,7 @@ async def check_payment(callback: CallbackQuery, session):
         await callback.answer("Не удалось проверить статус. Попробуйте позже.", show_alert=True)
 
 
-async def create_crypto_order(callback: CallbackQuery, session, product_id: int):
+async def create_crypto_order(callback: CallbackQuery, session, product_id: int, quantity: int = 1):
     log.info(
         "Checkout callback received: method=crypto telegram_id=%s product_id=%s",
         callback.from_user.id, product_id,
@@ -625,13 +596,21 @@ async def create_crypto_order(callback: CallbackQuery, session, product_id: int)
         await callback.answer("У товара некорректная цена. Обратитесь в поддержку.", show_alert=True)
         return
 
+    local_count = await session.scalar(
+        select(__import__('sqlalchemy').func.count(DigitalKey.id)).where(
+            DigitalKey.product_id == product.id, DigitalKey.status == "AVAILABLE"
+        )
+    ) or 0
+    if 0 < local_count < quantity:
+        await callback.answer(f"На складе доступно только {local_count} шт.", show_alert=True)
+        return
     key = await session.scalar(
         select(DigitalKey).where(
             DigitalKey.product_id == product.id, DigitalKey.status == "AVAILABLE"
         ).with_for_update(skip_locked=True).limit(1)
     )
-    use_supplier = key is None and product.supplier_name == "sandromania" and product.supplier_product_id
-    if key is None and not use_supplier:
+    use_supplier = local_count == 0 and product.supplier_name == "sandromania" and product.supplier_product_id
+    if local_count < quantity and not use_supplier:
         await callback.answer("Товар временно отсутствует", show_alert=True)
         return
     if use_supplier:
@@ -645,19 +624,20 @@ async def create_crypto_order(callback: CallbackQuery, session, product_id: int)
             log.exception("Supplier stock check failed for product_id=%s", product.id)
             await callback.answer("Не удалось проверить наличие. Попробуйте позже.", show_alert=True)
             return
-        if live_item is None or not product.supplier_available or not product.supplier_stock or product.supplier_stock <= 0:
+        if live_item is None or not product.supplier_available or not product.supplier_stock or product.supplier_stock < quantity:
             await callback.answer("Товар закончился.", show_alert=True)
             return
 
+    total_price = float(product.price) * quantity
     order = Order(
-        user_id=user.id, product_id=product.id, price=product.price,
+        user_id=user.id, product_id=product.id, price=total_price, quantity=quantity,
         status=OrderStatus.PENDING.value,
         idempotency_key=secrets.token_urlsafe(24) if use_supplier else None,
     )
     session.add(order)
     await session.flush()
     payment = Payment(
-        user_id=user.id, order_id=order.id, amount=float(product.price),
+        user_id=user.id, order_id=order.id, amount=total_price,
         provider="cryptobot", status="CREATING", payload=f"crypto-order-{order.id}",
     )
     session.add(payment)
@@ -665,7 +645,7 @@ async def create_crypto_order(callback: CallbackQuery, session, product_id: int)
 
     try:
         invoice = await CryptoBotClient().create_invoice(
-            product.price,
+            total_price,
             fiat=settings.currency,
             accepted_assets=settings.crypto_accepted_assets,
             description=f"BDAKA SHOP — заказ #{order.id}",
@@ -699,7 +679,7 @@ async def create_crypto_order(callback: CallbackQuery, session, product_id: int)
     await callback.answer("Счёт создан")
 
 
-async def create_balance_order(callback: CallbackQuery, session, product_id: int):
+async def create_balance_order(callback: CallbackQuery, session, product_id: int, quantity: int = 1):
     log.info(
         "Checkout callback received: method=balance telegram_id=%s product_id=%s",
         callback.from_user.id, product_id,
@@ -737,13 +717,21 @@ async def create_balance_order(callback: CallbackQuery, session, product_id: int
         )
         await callback.answer("У товара некорректная цена. Обратитесь в поддержку.", show_alert=True)
         return
+    local_count = await session.scalar(
+        select(__import__('sqlalchemy').func.count(DigitalKey.id)).where(
+            DigitalKey.product_id == product.id, DigitalKey.status == "AVAILABLE"
+        )
+    ) or 0
+    if 0 < local_count < quantity:
+        await callback.answer(f"На складе доступно только {local_count} шт.", show_alert=True)
+        return
     key = await session.scalar(
         select(DigitalKey).where(
             DigitalKey.product_id == product.id, DigitalKey.status == "AVAILABLE"
         ).with_for_update(skip_locked=True).limit(1)
     )
-    use_supplier = key is None and product.supplier_name == "sandromania" and product.supplier_product_id
-    if key is None and not use_supplier:
+    use_supplier = local_count == 0 and product.supplier_name == "sandromania" and product.supplier_product_id
+    if local_count < quantity and not use_supplier:
         await callback.answer("Товар временно отсутствует", show_alert=True)
         return
     if use_supplier:
@@ -757,23 +745,24 @@ async def create_balance_order(callback: CallbackQuery, session, product_id: int
             log.exception("Supplier stock check failed for product_id=%s", product.id)
             await callback.answer("Не удалось проверить наличие. Попробуйте позже.", show_alert=True)
             return
-        if live_item is None or not product.supplier_available or not product.supplier_stock or product.supplier_stock <= 0:
+        if live_item is None or not product.supplier_available or not product.supplier_stock or product.supplier_stock < quantity:
             await callback.answer("Товар закончился.", show_alert=True)
             return
-    if round(float(user.balance), 2) < round(float(product.price), 2):
+    total_price = float(product.price) * quantity
+    if round(float(user.balance), 2) < round(total_price, 2):
         await callback.answer("Недостаточно средств на балансе. Пополните баланс в профиле.", show_alert=True)
         return
 
     order = Order(
-        user_id=user.id, product_id=product.id, price=product.price,
+        user_id=user.id, product_id=product.id, price=total_price, quantity=quantity,
         status=OrderStatus.PAID.value,
         idempotency_key=secrets.token_urlsafe(24) if use_supplier else None,
     )
-    user.balance -= product.price
+    user.balance -= total_price
     session.add(order)
     await session.flush()
     session.add(Transaction(
-        user_id=user.id, amount=-product.price, type="PURCHASE",
+        user_id=user.id, amount=-total_price, type="PURCHASE",
         description=f"Покупка #{order.id}: {product.name}",
     ))
     await session.commit()

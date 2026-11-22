@@ -2,12 +2,12 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config.settings import settings
 
 
-def payment_method_keyboard(product_id: int):
+def payment_method_keyboard(product_id: int, quantity: int = 1):
     kb = InlineKeyboardBuilder()
-    kb.button(text="⭐ Оплатить Telegram Stars", callback_data=f"buy:stars:{product_id}")
+    kb.button(text="⭐ Оплатить Telegram Stars", callback_data=f"buy:stars:{product_id}:{quantity}")
     if settings.crypto_pay_enabled:
-        kb.button(text="🪙 Оплатить криптой (Crypto Bot)", callback_data=f"buy:crypto:{product_id}")
-    kb.button(text="💰 Оплатить с баланса", callback_data=f"buy:balance:{product_id}")
+        kb.button(text="🪙 Оплатить криптой (Crypto Bot)", callback_data=f"buy:crypto:{product_id}:{quantity}")
+    kb.button(text="💰 Оплатить с баланса", callback_data=f"buy:balance:{product_id}:{quantity}")
     kb.button(text="⬅️ Назад к товару", callback_data=f"product:{product_id}")
     kb.button(text="🏠 Вернуться в главное меню", callback_data="menu:home")
     kb.adjust(1)

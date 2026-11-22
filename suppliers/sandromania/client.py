@@ -81,6 +81,34 @@ def _find_delivery(data):
     return None
 
 
+
+def _find_deliveries(data):
+    """Collect distinct delivery codes/links from a supplier response."""
+    code_names = {"cdk", "code", "key", "activation_code", "license_key", "license", "serial", "serial_key"}
+    link_names = {"activation_url", "activation_link", "redeem_url", "redeem_link", "delivery_url", "delivery_link", "download_url", "product_url", "link", "url"}
+    found = []
+    def walk(obj):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                key_name = str(key).lower()
+                if key_name in code_names:
+                    values = value if isinstance(value, list) else [value]
+                    for item in values:
+                        if isinstance(item, (str, int)) and str(item).strip():
+                            found.append(str(item).strip())
+                elif key_name in link_names:
+                    values = value if isinstance(value, list) else [value]
+                    for item in values:
+                        if isinstance(item, str) and item.strip().startswith(("https://", "http://")):
+                            found.append(item.strip())
+                walk(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+    walk(data)
+    return list(dict.fromkeys(found))
+
+
 def _find_status(data):
     value = _find_value(data, ("status", "state", "order_status"))
     return str(value or "").strip().lower()
@@ -160,20 +188,23 @@ class SandromaniaClient:
         path = f"/api/v1/orders/{quote(str(order_id), safe='')}"
         return await self._request("GET", path)
 
-    async def purchase_and_wait(self, supplier_product_id: int, idempotency_key: str):
-        created = await self.create_order(supplier_product_id, 1, idempotency_key)
+    async def purchase_and_wait(self, supplier_product_id: int, idempotency_key: str, quantity: int = 1):
+        created = await self.create_order(supplier_product_id, quantity, idempotency_key)
 
         order_id = _find_order_id(created)
         delivery = _find_delivery(created)
+        deliveries = _find_deliveries(created)
         status = _find_status(created)
 
-        if delivery:
+        if delivery or len(deliveries) >= quantity:
+            first_delivery = delivery[0] if delivery else deliveries[0]
             return {
                 "order_id": order_id or "",
                 "status": "completed",
-                "code": delivery[0],          # Backward compatibility with existing callers
-                "delivery": delivery[0],
-                "delivery_type": delivery[1],
+                "code": first_delivery,
+                "delivery": first_delivery,
+                "deliveries": deliveries or [first_delivery],
+                "delivery_type": delivery[1] if delivery else "code",
                 "raw": created,
             }
 
@@ -204,15 +235,18 @@ class SandromaniaClient:
 
             current = await self.get_order(order_id)
             delivery = _find_delivery(current)
+            deliveries = _find_deliveries(current)
             status = _find_status(current) or status
 
-            if delivery:
+            if delivery or len(deliveries) >= quantity:
+                first_delivery = delivery[0] if delivery else deliveries[0]
                 return {
                     "order_id": order_id,
                     "status": "completed",
-                    "code": delivery[0],
-                    "delivery": delivery[0],
-                    "delivery_type": delivery[1],
+                    "code": first_delivery,
+                    "delivery": first_delivery,
+                    "deliveries": deliveries or [first_delivery],
+                    "delivery_type": delivery[1] if delivery else "code",
                     "raw": current,
                 }
 
