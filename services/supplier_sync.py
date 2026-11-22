@@ -73,7 +73,12 @@ def _normalize(row: dict) -> dict | None:
     if raw_id is None or not name or not str(raw_id).isdigit():
         return None
 
-    cost = _as_number(_first(row, ("price_rub", "price", "cost", "supplier_price", "amount")))
+    # Sandromania's partner catalog returns prices for the current API key.
+    # Prefer the explicit retail/API price field; price_rub is kept only as a
+    # compatibility fallback for older catalog payloads.
+    cost = _as_number(_first(row, (
+        "retail_price", "price", "price_rub", "cost", "supplier_price", "amount"
+    )))
     stock = _as_number(
         _first(row, ("stock", "quantity", "available_quantity", "balance", "in_stock")),
         integer=True,

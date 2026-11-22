@@ -961,6 +961,80 @@ async def supplier_products(message: Message):
     )
 
 
+@router.message(Command("supplierdebug"))
+async def supplier_price_debug(message: Message):
+    """Show only price-related fields from Sandromania catalog for diagnosis."""
+    if not is_admin(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    target_id = parts[1].strip() if len(parts) > 1 else None
+    try:
+        from suppliers.sandromania.client import SandromaniaClient
+        from services.supplier_sync import _unwrap_catalog
+        payload = await SandromaniaClient().get_products()
+        rows = _unwrap_catalog(payload)
+    except Exception as exc:
+        log.exception("Sandromania price diagnostic failed")
+        await message.answer(f"Не удалось получить каталог: {escape(str(exc)[:300])}")
+        return
+
+    def get_id(row):
+        for key in ("product_id", "id", "sku_id"):
+            value = row.get(key)
+            if value is not None:
+                return str(value)
+        return "?"
+
+    def get_name(row):
+        for key in ("name", "title", "product_name"):
+            value = row.get(key)
+            if value:
+                return str(value)
+        return "Без названия"
+
+    def price_fields(obj, prefix="", depth=0):
+        found = []
+        if depth > 5:
+            return found
+        price_words = ("price", "cost", "retail", "wholesale", "tier", "tariff", "discount")
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                path = f"{prefix}.{key}" if prefix else str(key)
+                if any(word in str(key).lower() for word in price_words):
+                    if isinstance(value, (str, int, float, bool)) or value is None:
+                        found.append(f"{path} = {value}")
+                    else:
+                        found.append(f"{path} = {str(value)[:350]}")
+                elif isinstance(value, (dict, list)):
+                    found.extend(price_fields(value, path, depth + 1))
+        elif isinstance(obj, list):
+            for index, value in enumerate(obj[:30]):
+                if isinstance(value, (dict, list)):
+                    found.extend(price_fields(value, f"{prefix}[{index}]", depth + 1))
+        return found
+
+    if target_id:
+        selected = [row for row in rows if get_id(row) == target_id]
+        if not selected:
+            await message.answer(f"Товар с ID поставщика {escape(target_id)} не найден в каталоге.")
+            return
+    else:
+        selected = rows[:3]
+
+    blocks = []
+    for row in selected[:3]:
+        fields = price_fields(row)
+        blocks.append(
+            f"<b>{escape(get_name(row))}</b> (supplier ID: <code>{escape(get_id(row))}</code>)\n" +
+            ("\n".join(escape(line[:500]) for line in fields[:35]) if fields else "Ценовые поля не найдены")
+        )
+    await message.answer(
+        "<b>Диагностика цен Sandromania</b>\n"
+        "Показаны только названия ценовых полей и их значения; секреты API не выводятся.\n\n" +
+        "\n\n".join(blocks)[:3800]
+    )
+
+
 # ---------- Интерактивная панель управления наценкой ----------
 
 @router.callback_query(F.data == "admin:descriptions")

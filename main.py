@@ -16,7 +16,14 @@ async def main():
     await register_bot_commands(bot, settings.admins)
     runner = None
     poller = None
+    supplier_sync_task = None
     try:
+        if settings.sandromania_enabled:
+            from services.supplier_price_scheduler import supplier_price_sync_loop
+            supplier_sync_task = asyncio.create_task(supplier_price_sync_loop())
+            logging.getLogger(__name__).info(
+                "Sandromania retail price sync started (every 4 hours)"
+            )
         if settings.crypto_pay_enabled:
             from services.payment_service import crypto_payment_poller
             poller = asyncio.create_task(crypto_payment_poller(bot))
@@ -36,6 +43,12 @@ async def main():
     finally:
         if poller:
             poller.cancel()
+        if supplier_sync_task:
+            supplier_sync_task.cancel()
+            try:
+                await supplier_sync_task
+            except asyncio.CancelledError:
+                pass
         if runner:
             await runner.cleanup()
         await bot.session.close()

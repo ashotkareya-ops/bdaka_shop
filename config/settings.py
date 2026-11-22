@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     supplier_low_balance_rub: float = Field(default=500.0, alias="SUPPLIER_LOW_BALANCE_RUB")
     sandromania_poll_attempts: int = 8
     sandromania_poll_interval: float = 2.0
+    supplier_sync_interval_seconds: int = Field(default=14400, alias="SUPPLIER_SYNC_INTERVAL_SECONDS")
 
     platega_base_url: str = "https://app.platega.io"
     platega_merchant_id: str = ""
