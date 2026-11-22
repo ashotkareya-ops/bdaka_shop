@@ -645,8 +645,9 @@ async def set_product_description(message: Message, state: FSMContext, session):
     await state.update_data(description_product_id=product_id)
     await message.answer(
         f"Отправь новое описание для товара «{product.name}».\n"
-        "Можно отправить несколько абзацев. Чтобы удалить описание, отправь /clear.\n"
-        "Для отмены — /cancel."
+        "Можно отправить несколько абзацев. Чтобы автоматически показывать актуальную цену внутри описания, используй {{price}} (или {{price_rub}}); валюту — {{currency}}.\n"
+        "Например: 💰 Стоимость: {{price}} {{currency}}\n"
+        "Чтобы удалить описание, отправь /clear. Для отмены — /cancel."
     )
 
 
@@ -984,6 +985,9 @@ async def admin_description_edit(callback: CallbackQuery, state: FSMContext, ses
     await callback.message.answer(
         f"📝 <b>{product.name}</b>\n"
         "Отправь новое описание следующим сообщением. Можно использовать эмодзи и переносы строк.\n"
+        "Ссылки вида https://example.com автоматически станут кликабельными.\n"
+        "Для динамической цены используй {{price}} (или {{price_rub}}), для валюты — {{currency}}.\n"
+        "Описание покупателю будет показано в отдельном блоке-цитате.\n"
         "Чтобы удалить описание, отправь /clear. Для отмены — /cancel."
     )
     await callback.answer()

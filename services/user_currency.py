@@ -18,4 +18,4 @@ async def format_user_balance(session, amount_rub: float, currency: str) -> str:
 
 async def currency_rate_line(session) -> str:
     rate = await get_usd_rub_rate(session)
-    return f"Курс магазина: 1 USD = {rate:.4f} RUB"
+    return f"Курс магазина: 1 USD = {rate:.2f} RUB"

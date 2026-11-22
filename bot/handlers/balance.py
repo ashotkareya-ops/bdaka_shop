@@ -370,10 +370,10 @@ async def choose_crypto_method(callback: CallbackQuery, session):
     await send_section(
         callback.message,
         "wallet.png",
-        "🪙 <b>CRYPTO BOT (USDT)</b>\\n\\n"
-        "Оплата принимается в USD/USDT. Баланс магазина всегда ведётся в рублях.\\n"
-        f"Текущий курс магазина: <b>1 USD = {rate:.4f} ₽</b>.\\n"
-        f"Например, 5 USD = <b>{5 * rate:.2f} ₽</b> на баланс.\\n\\n"
+        "🪙 <b>CRYPTO BOT (USDT)</b>\n\n"
+        "Оплата принимается в USD/USDT. Баланс магазина всегда ведётся в рублях.\n"
+        f"Текущий курс магазина: <b>1 USD = {rate:.2f} ₽</b>.\n"
+        f"Например, 5 USD = <b>{5 * rate:.2f} ₽</b> на баланс.\n\n"
         "Выберите сумму пополнения или введите свою.",
         reply_markup=topup_crypto_amount_keyboard(),
     )
