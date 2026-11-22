@@ -292,9 +292,6 @@ async def create_stars_order(callback: CallbackQuery, session, product_id: int):
             await callback.answer("Товар закончился.", show_alert=True)
             return
 
-    if use_supplier and not await _supplier_ready(callback, product):
-        return
-
     stars = _stars_for_rubles(product.price)
     order = Order(
         user_id=user.id,
@@ -652,9 +649,6 @@ async def create_crypto_order(callback: CallbackQuery, session, product_id: int)
             await callback.answer("Товар закончился.", show_alert=True)
             return
 
-    if use_supplier and not await _supplier_ready(callback, product):
-        return
-
     order = Order(
         user_id=user.id, product_id=product.id, price=product.price,
         status=OrderStatus.PENDING.value,
@@ -703,24 +697,6 @@ async def create_crypto_order(callback: CallbackQuery, session, product_id: int)
         reply_markup=invoice_keyboard(str(pay_url), order.id),
     )
     await callback.answer("Счёт создан")
-
-
-async def _supplier_ready(callback: CallbackQuery, product) -> bool:
-    """Do not take money for a product the supplier balance cannot cover."""
-    from services.supplier_sync import supplier_can_afford
-    from services.payment_service import supplier_balance_watch
-    try:
-        ok = await supplier_can_afford(product)
-    except Exception:
-        log.exception("Supplier balance check failed for product_id=%s", product.id)
-        await callback.answer("Не удалось проверить доступность товара. Попробуйте позже.", show_alert=True)
-        return False
-    if not ok:
-        log.warning("Supplier balance too low for product_id=%s", product.id)
-        await supplier_balance_watch(callback.bot, force=True)
-        await callback.answer("Товар временно недоступен. Попробуйте позже.", show_alert=True)
-        return False
-    return True
 
 
 async def create_balance_order(callback: CallbackQuery, session, product_id: int):
@@ -783,8 +759,6 @@ async def create_balance_order(callback: CallbackQuery, session, product_id: int
             return
         if live_item is None or not product.supplier_available or not product.supplier_stock or product.supplier_stock <= 0:
             await callback.answer("Товар закончился.", show_alert=True)
-            return
-        if not await _supplier_ready(callback, product):
             return
     if round(float(user.balance), 2) < round(float(product.price), 2):
         await callback.answer("Недостаточно средств на балансе. Пополните баланс в профиле.", show_alert=True)
