@@ -92,8 +92,33 @@ async def buy_product(callback: CallbackQuery, session):
         select(User).where(User.telegram_id == callback.from_user.id).with_for_update()
     )
     product = await session.get(Product, product_id)
-    if not user or not product or not product.is_active:
-        await callback.answer("Не удалось оформить заказ", show_alert=True)
+    if not user:
+        log.warning(
+            "Checkout rejected: reason=user_not_found telegram_id=%s product_id=%s",
+            callback.from_user.id, product_id,
+        )
+        await callback.answer("Профиль покупателя не найден. Отправьте /start и повторите попытку.", show_alert=True)
+        return
+    if not product:
+        log.warning(
+            "Checkout rejected: reason=product_not_found telegram_id=%s product_id=%s",
+            callback.from_user.id, product_id,
+        )
+        await callback.answer("Товар не найден. Обновите каталог.", show_alert=True)
+        return
+    if not product.is_active:
+        log.warning(
+            "Checkout rejected: reason=product_inactive telegram_id=%s product_id=%s",
+            callback.from_user.id, product_id,
+        )
+        await callback.answer("Этот товар временно недоступен.", show_alert=True)
+        return
+    if product.price is None or float(product.price) <= 0:
+        log.warning(
+            "Checkout rejected: reason=invalid_price telegram_id=%s product_id=%s price=%s",
+            callback.from_user.id, product_id, product.price,
+        )
+        await callback.answer("У товара некорректная цена. Обратитесь в поддержку.", show_alert=True)
         return
 
     key = await session.scalar(
@@ -197,13 +222,42 @@ async def buy_product(callback: CallbackQuery, session):
 
 
 async def create_stars_order(callback: CallbackQuery, session, product_id: int):
+    log.info(
+        "Checkout callback received: method=stars telegram_id=%s product_id=%s",
+        callback.from_user.id, product_id,
+    )
     """Create a Telegram Stars invoice for a digital product."""
     user = await session.scalar(
         select(User).where(User.telegram_id == callback.from_user.id).with_for_update()
     )
     product = await session.get(Product, product_id)
-    if not user or not product or not product.is_active or product.price <= 0:
-        await callback.answer("Не удалось оформить заказ", show_alert=True)
+    if not user:
+        log.warning(
+            "Checkout rejected: reason=user_not_found telegram_id=%s product_id=%s",
+            callback.from_user.id, product_id,
+        )
+        await callback.answer("Профиль покупателя не найден. Отправьте /start и повторите попытку.", show_alert=True)
+        return
+    if not product:
+        log.warning(
+            "Checkout rejected: reason=product_not_found telegram_id=%s product_id=%s",
+            callback.from_user.id, product_id,
+        )
+        await callback.answer("Товар не найден. Обновите каталог.", show_alert=True)
+        return
+    if not product.is_active:
+        log.warning(
+            "Checkout rejected: reason=product_inactive telegram_id=%s product_id=%s",
+            callback.from_user.id, product_id,
+        )
+        await callback.answer("Этот товар временно недоступен.", show_alert=True)
+        return
+    if product.price is None or float(product.price) <= 0:
+        log.warning(
+            "Checkout rejected: reason=invalid_price telegram_id=%s product_id=%s price=%s",
+            callback.from_user.id, product_id, product.price,
+        )
+        await callback.answer("У товара некорректная цена. Обратитесь в поддержку.", show_alert=True)
         return
 
     key = await session.scalar(
@@ -355,12 +409,41 @@ async def confirm_stars_order(message, session):
 
 
 async def create_platega_order(callback: CallbackQuery, session, product_id: int):
+    log.info(
+        "Checkout callback received: method=platega telegram_id=%s product_id=%s",
+        callback.from_user.id, product_id,
+    )
     user = await session.scalar(
         select(User).where(User.telegram_id == callback.from_user.id).with_for_update()
     )
     product = await session.get(Product, product_id)
-    if not user or not product or not product.is_active or product.price <= 0:
-        await callback.answer("Не удалось оформить заказ", show_alert=True)
+    if not user:
+        log.warning(
+            "Checkout rejected: reason=user_not_found telegram_id=%s product_id=%s",
+            callback.from_user.id, product_id,
+        )
+        await callback.answer("Профиль покупателя не найден. Отправьте /start и повторите попытку.", show_alert=True)
+        return
+    if not product:
+        log.warning(
+            "Checkout rejected: reason=product_not_found telegram_id=%s product_id=%s",
+            callback.from_user.id, product_id,
+        )
+        await callback.answer("Товар не найден. Обновите каталог.", show_alert=True)
+        return
+    if not product.is_active:
+        log.warning(
+            "Checkout rejected: reason=product_inactive telegram_id=%s product_id=%s",
+            callback.from_user.id, product_id,
+        )
+        await callback.answer("Этот товар временно недоступен.", show_alert=True)
+        return
+    if product.price is None or float(product.price) <= 0:
+        log.warning(
+            "Checkout rejected: reason=invalid_price telegram_id=%s product_id=%s price=%s",
+            callback.from_user.id, product_id, product.price,
+        )
+        await callback.answer("У товара некорректная цена. Обратитесь в поддержку.", show_alert=True)
         return
 
     key = await session.scalar(
@@ -502,6 +585,10 @@ async def check_payment(callback: CallbackQuery, session):
 
 
 async def create_crypto_order(callback: CallbackQuery, session, product_id: int):
+    log.info(
+        "Checkout callback received: method=crypto telegram_id=%s product_id=%s",
+        callback.from_user.id, product_id,
+    )
     """Create an order and a Crypto Pay invoice (price in RUB, buyer pays in crypto)."""
     from payments.providers.cryptobot import CryptoBotClient, CryptoBotError
 
@@ -512,8 +599,33 @@ async def create_crypto_order(callback: CallbackQuery, session, product_id: int)
         select(User).where(User.telegram_id == callback.from_user.id).with_for_update()
     )
     product = await session.get(Product, product_id)
-    if not user or not product or not product.is_active or product.price <= 0:
-        await callback.answer("Не удалось оформить заказ", show_alert=True)
+    if not user:
+        log.warning(
+            "Checkout rejected: reason=user_not_found telegram_id=%s product_id=%s",
+            callback.from_user.id, product_id,
+        )
+        await callback.answer("Профиль покупателя не найден. Отправьте /start и повторите попытку.", show_alert=True)
+        return
+    if not product:
+        log.warning(
+            "Checkout rejected: reason=product_not_found telegram_id=%s product_id=%s",
+            callback.from_user.id, product_id,
+        )
+        await callback.answer("Товар не найден. Обновите каталог.", show_alert=True)
+        return
+    if not product.is_active:
+        log.warning(
+            "Checkout rejected: reason=product_inactive telegram_id=%s product_id=%s",
+            callback.from_user.id, product_id,
+        )
+        await callback.answer("Этот товар временно недоступен.", show_alert=True)
+        return
+    if product.price is None or float(product.price) <= 0:
+        log.warning(
+            "Checkout rejected: reason=invalid_price telegram_id=%s product_id=%s price=%s",
+            callback.from_user.id, product_id, product.price,
+        )
+        await callback.answer("У товара некорректная цена. Обратитесь в поддержку.", show_alert=True)
         return
 
     key = await session.scalar(
@@ -612,13 +724,42 @@ async def _supplier_ready(callback: CallbackQuery, product) -> bool:
 
 
 async def create_balance_order(callback: CallbackQuery, session, product_id: int):
+    log.info(
+        "Checkout callback received: method=balance telegram_id=%s product_id=%s",
+        callback.from_user.id, product_id,
+    )
     """Pay for a product from the internal balance, then run the normal fulfilment."""
     user = await session.scalar(
         select(User).where(User.telegram_id == callback.from_user.id).with_for_update()
     )
     product = await session.get(Product, product_id)
-    if not user or not product or not product.is_active or product.price <= 0:
-        await callback.answer("Не удалось оформить заказ", show_alert=True)
+    if not user:
+        log.warning(
+            "Checkout rejected: reason=user_not_found telegram_id=%s product_id=%s",
+            callback.from_user.id, product_id,
+        )
+        await callback.answer("Профиль покупателя не найден. Отправьте /start и повторите попытку.", show_alert=True)
+        return
+    if not product:
+        log.warning(
+            "Checkout rejected: reason=product_not_found telegram_id=%s product_id=%s",
+            callback.from_user.id, product_id,
+        )
+        await callback.answer("Товар не найден. Обновите каталог.", show_alert=True)
+        return
+    if not product.is_active:
+        log.warning(
+            "Checkout rejected: reason=product_inactive telegram_id=%s product_id=%s",
+            callback.from_user.id, product_id,
+        )
+        await callback.answer("Этот товар временно недоступен.", show_alert=True)
+        return
+    if product.price is None or float(product.price) <= 0:
+        log.warning(
+            "Checkout rejected: reason=invalid_price telegram_id=%s product_id=%s price=%s",
+            callback.from_user.id, product_id, product.price,
+        )
+        await callback.answer("У товара некорректная цена. Обратитесь в поддержку.", show_alert=True)
         return
     key = await session.scalar(
         select(DigitalKey).where(
