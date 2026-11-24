@@ -82,10 +82,10 @@ AGREEMENT_TEXT = r"""📄 <b>ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИ
 
 async def _send_profile(target, user):
     text = (
-        "👤 <b>ПРОФИЛЬ</b>\\n"
-        f"🆔 ID: <code>{user.telegram_id}</code>\\n"
-        f"💰 Баланс: <b>{user.balance:.2f} ₽</b>\\n"
-        f"🛍 Покупок: <b>{user.purchase_count}</b>\\n\\n"
+        "👤 <b>ПРОФИЛЬ</b>\n"
+        f"🆔 ID: <code>{user.telegram_id}</code>\n"
+        f"💰 Баланс: <b>{user.balance:.2f} ₽</b>\n"
+        f"🛍 Покупок: <b>{user.purchase_count}</b>\n\n"
         "Выберите нужный раздел:"
     )
     await send_section(target, "profile.png", text, reply_markup=profile_keyboard())
@@ -99,19 +99,23 @@ def _document_keyboard():
 
 
 async def _show_document(callback: CallbackQuery, text: str):
-    # Documents are sent as ordinary text messages (not photo captions),
-    # so the complete text is not cut off by Telegram's 1024-character caption limit.
+    # Acknowledge the button immediately so Telegram does not keep the
+    # loading spinner while the document message is being sent.
+    await callback.answer()
+
     try:
         await callback.message.delete()
     except Exception:
         pass
+
+    # Send as a normal message, not a photo caption: Telegram captions have
+    # a 1024-character limit, while text messages support up to 4096 chars.
     await callback.bot.send_message(
         chat_id=callback.message.chat.id,
         text=text,
         reply_markup=_document_keyboard(),
         disable_web_page_preview=True,
     )
-    await callback.answer()
 
 
 @router.message(Command("profile"))
