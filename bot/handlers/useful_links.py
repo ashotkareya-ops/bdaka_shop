@@ -15,10 +15,12 @@ def links_keyboard():
     kb.button(text="🎧 Поддержка", callback_data="links:support")
     kb.button(text="⭐ Отзывы", callback_data="links:reviews")
     kb.button(text="❗ Правила", callback_data="links:rules")
+    kb.button(text="🔐 Политика конфиденциальности", callback_data="legal:privacy")
+    kb.button(text="📄 Пользовательское соглашение", callback_data="legal:agreement")
     kb.button(text="📢 Новости", callback_data="links:channel")
     kb.button(text="💬 Чат магазина", url=settings.shop_chat_url)
     kb.button(text="🏠 Главное меню", callback_data="menu:home")
-    kb.adjust(2, 2, 2, 1)
+    kb.adjust(2, 2, 1, 1, 1, 1)
     return kb.as_markup()
 
 
