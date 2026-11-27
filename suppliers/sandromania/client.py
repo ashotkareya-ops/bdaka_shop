@@ -173,6 +173,22 @@ class SandromaniaClient:
     async def get_balance(self):
         return await self._request("GET", "/api/v1/balance")
 
+    async def get_balance_rub(self) -> float:
+        """Return supplier balance in RUB; reject unknown currency/response shapes."""
+        data = await self.get_balance()
+        if not isinstance(data, dict):
+            raise SandromaniaAPIError("Unexpected Sandromania balance response")
+        currency = _find_value(data, ("currency", "asset"))
+        amount = _find_value(data, ("balance", "available_balance", "amount", "available"))
+        if amount is None:
+            raise SandromaniaAPIError("Balance amount is missing in Sandromania response")
+        if currency and str(currency).upper() not in {"RUB", "RUR"}:
+            raise SandromaniaAPIError(f"Unsupported supplier balance currency: {currency}")
+        try:
+            return float(amount)
+        except (TypeError, ValueError) as exc:
+            raise SandromaniaAPIError("Invalid supplier balance amount") from exc
+
     async def create_order(self, supplier_product_id: int, quantity: int, idempotency_key: str):
         if not 1 <= quantity <= 100:
             raise ValueError("quantity must be between 1 and 100")

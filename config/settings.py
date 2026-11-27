@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     # Admin-only /simulatepay for testing the fulfilment flow without a real payment. Keep OFF in production.
     allow_test_payments: bool = Field(default=False, alias="ALLOW_TEST_PAYMENTS")
     supplier_low_balance_rub: float = Field(default=500.0, alias="SUPPLIER_LOW_BALANCE_RUB")
+    api_secret_encryption_key: str = Field(default="", alias="API_SECRET_ENCRYPTION_KEY")
+    api_public_url: str = Field(default="", alias="API_PUBLIC_URL")
     sandromania_poll_attempts: int = 8
     sandromania_poll_interval: float = 2.0
     supplier_sync_interval_seconds: int = Field(default=14400, alias="SUPPLIER_SYNC_INTERVAL_SECONDS")

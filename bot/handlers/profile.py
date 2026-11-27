@@ -2,12 +2,20 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+import hashlib
+import secrets
+import logging
+from utils.partner_crypto import encrypt_partner_secret
+from datetime import datetime
+from sqlalchemy import text
 from sqlalchemy import select
 from database.models.user import User
+from config.settings import settings
 from bot.keyboards.profile import profile_keyboard
 from bot.utils.section_media import send_section
 
 router = Router()
+log = logging.getLogger(__name__)
 
 PRIVACY_TEXT = r"""🔐 <b>ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ BDAKA SHOP</b>
 Редакция от 24 ноября 2026 года
@@ -130,12 +138,12 @@ async def profile(message: Message, session):
 
 @router.callback_query(F.data == "menu:profile")
 async def profile_from_home(callback: CallbackQuery, session):
+    await callback.answer()
     user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
     if not user:
-        await callback.answer("Сначала нажмите /start", show_alert=True)
+        await callback.message.answer("Сначала нажмите /start")
         return
     await _send_profile(callback.message, user)
-    await callback.answer()
 
 
 @router.callback_query(F.data == "profile:privacy")
@@ -150,9 +158,220 @@ async def profile_agreement(callback: CallbackQuery):
 
 @router.callback_query(F.data == "profile:home")
 async def profile_home(callback: CallbackQuery, session):
+    await callback.answer()
     user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
     if not user:
-        await callback.answer("Пользователь не найден", show_alert=True)
+        await callback.message.answer("Пользователь не найден")
         return
     await _send_profile(callback.message, user)
+
+
+# ---------------------------------------------------------------------------
+# Partner API access. Secret Key is shown once; only encrypted at rest.
+# ---------------------------------------------------------------------------
+
+def _partner_api_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📚 Документация API", callback_data="partner:docs")
+    kb.button(text="🔑 Получить API-ключи", callback_data="partner:keys")
+    kb.button(text="↩️ Назад в профиль", callback_data="profile:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def _partner_keys_keyboard(has_active_key: bool = False):
+    kb = InlineKeyboardBuilder()
+    if has_active_key:
+        kb.button(text="🔄 Перевыпустить пару ключей", callback_data="partner:rotate")
+    else:
+        kb.button(text="🔑 Создать пару ключей", callback_data="partner:create")
+    kb.button(text="↩️ Назад", callback_data="partner:api")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+
+@router.callback_query(F.data == "partner:api")
+async def partner_api_info(callback: CallbackQuery):
     await callback.answer()
+
+    api_url = settings.api_public_url.rstrip("/") if settings.api_public_url else None
+
+    text = (
+        "🤝 <b>ПАРТНЁРСКИЙ API BDAKA STORE</b>\n\n"
+        "Подключите свой сайт или Telegram-бот к BDAKA STORE "
+        "и автоматизируйте получение товаров и оформление заказов.\n\n"
+        "🔹 Просмотр каталога и цен\n"
+        "🔹 Проверка баланса\n"
+        "🔹 Создание заказов\n"
+        "🔹 Получение статусов и цифровой выдачи\n\n"
+        "💰 <b>Единый баланс</b>\n"
+        "Заказы через API оплачиваются с вашего обычного баланса BDAKA SHOP. "
+        "Отдельное пополнение не требуется.\n\n"
+        "🔐 <b>Подключение</b>\n"
+        "Каждому партнёру выдаются индивидуальные Public Key и Secret Key. "
+        "Настройте их один раз — подпись запросов будет формироваться автоматически.\n\n"
+    )
+
+    if api_url:
+        text += f"🌐 <b>Адрес API:</b>\n<code>{api_url}</code>\n\n"
+
+    text += "Выберите нужный раздел:"
+
+    await callback.message.answer(
+        text,
+        reply_markup=_partner_api_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "partner:keys")
+async def partner_api_keys_menu(callback: CallbackQuery, session):
+    await callback.answer()
+    user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+    if not user:
+        await callback.message.answer("Сначала нажмите /start")
+        return
+    result = await session.execute(text("""
+        SELECT p.id AS partner_id, k.key_prefix
+        FROM partners p
+        LEFT JOIN partner_api_keys k ON k.partner_id = p.id AND k.is_active = TRUE
+        WHERE p.user_id = :user_id
+        ORDER BY k.id DESC LIMIT 1
+    """), {"user_id": user.id})
+    partner = result.mappings().first()
+    has_key = bool(partner and partner.get("key_prefix"))
+    body = (
+        "🔐 <b>УПРАВЛЕНИЕ API-КЛЮЧАМИ</b>\n\n"
+        + (f"Активная пара найдена. Префикс Public Key: <code>{partner['key_prefix']}</code>.\n"
+           "Secret Key повторно не показывается. Если он утерян или раскрыт, перевыпустите пару.\n\n"
+           if has_key else "У вас пока нет активной пары ключей.\n\n")
+        + "При перевыпуске предыдущая пара немедленно отключается. Сохраните новую пару в защищённом месте."
+    )
+    await callback.message.answer(body, reply_markup=_partner_keys_keyboard(has_key))
+
+
+@router.callback_query(F.data == "partner:docs")
+async def partner_api_docs(callback: CallbackQuery):
+    await callback.answer()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="↩️ Назад", callback_data="partner:api")
+    kb.adjust(1)
+    docs = (
+        "📚 <b>ДОКУМЕНТАЦИЯ BDAKA STORE API</b>\n\n"
+        "<b>Авторизация</b>\n"
+        "Каждый запрос подписывается HMAC-SHA256. Партнёр получает пару ключей в этом боте.\n"
+        + (f"Базовый адрес: <code>{settings.api_public_url.rstrip('/')}</code>\n\n" if settings.api_public_url else "Базовый HTTPS-адрес API уточните у поддержки.\n\n")
+        + "Используется ваш обычный баланс BDAKA SHOP: пополнение и списание общие для покупок в боте и через API.\n"
+        "• Public Key отправляется в заголовке <code>X-API-Key</code>.\n"
+        "• Secret Key используется только локально для подписи и никогда не отправляется серверу.\n\n"
+        "<b>Обязательные заголовки</b>\n"
+        "<code>X-API-Key</code> — Public Key\n"
+        "<code>X-Timestamp</code> — Unix-время в секундах\n"
+        "<code>X-Nonce</code> — случайная уникальная строка (16–128 символов)\n"
+        "<code>X-Signature</code> — hex HMAC-SHA256\n\n"
+        "<b>Строка для подписи</b>\n"
+        "<code>METHOD\nPATH_AND_QUERY\nTIMESTAMP\nNONCE\nSHA256_HEX(BODY)</code>\n"
+        "HMAC вычисляется алгоритмом SHA-256 с Secret Key в качестве ключа. Для GET без тела используется пустое тело. "
+        "Подписывайте точные путь, query string и байты JSON, которые отправляете. Время допускается с отклонением до 5 минут; повторный Nonce отклоняется.\n\n"
+        "<b>Доступные методы</b>\n"
+        "<code>GET /api/v1/partners/me</code> — профиль партнёра\n"
+        "<code>GET /api/v1/products</code> — каталог\n"
+        "<code>GET /api/v1/products/{id}</code> — товар\n"
+        "<code>GET /api/v1/categories</code> — категории\n"
+        "<code>GET /api/v1/balance</code> — баланс\n"
+        "<code>GET /api/v1/balance/transactions</code> — операции\n"
+        "<code>POST /api/v1/orders</code> — создать заказ\n"
+        "<code>GET /api/v1/orders</code> — список заказов\n"
+        "<code>GET /api/v1/orders/{id}</code> — статус и выдача\n\n"
+        "<b>Создание заказа</b>\n"
+        "JSON: <code>{\"product_id\": 8, \"quantity\": 1}</code>. Обязательно передавайте уникальный <code>Idempotency-Key</code> (16–120 символов). Повтор одного запроса должен использовать тот же ключ. Заказ реальный: средства списываются, после чего бот выполняет выдачу.\n\n"
+        "<b>Безопасность</b>\n"
+        "Не вставляйте Secret Key в публичный код, frontend, Git или сообщения. Храните его в переменных окружения на сервере. При утечке немедленно перевыпустите пару. Используйте HTTPS в production.\n\n"
+        "После POST /orders проверяйте GET /orders/{id}, пока статус не станет COMPLETED; только тогда передавайте delivery своему клиенту.\n"
+        "Примеры Python, Node.js и PHP и подробная документация выдаются вместе с партнёрским SDK. Не отправляйте Secret Key в браузер."
+    )
+    await callback.message.answer(docs, reply_markup=kb.as_markup())
+
+
+async def _issue_partner_token(session, telegram_user, rotate: bool) -> str:
+    user = await session.scalar(select(User).where(User.telegram_id == telegram_user.id).with_for_update())
+    if not user:
+        raise ValueError("Пользователь не найден")
+
+    partner_result = await session.execute(text("""
+        INSERT INTO partners (user_id, name, is_active, created_at)
+        VALUES (:user_id, :name, TRUE, :created_at)
+        ON CONFLICT (user_id)
+        DO UPDATE SET name = EXCLUDED.name, is_active = TRUE
+        RETURNING id
+    """), {
+        "user_id": user.id,
+        "name": (telegram_user.full_name or telegram_user.username or f"Partner {telegram_user.id}")[:120],
+        "created_at": datetime.utcnow(),
+    })
+    partner_id = int(partner_result.scalar_one())
+
+    active_result = await session.execute(text("""
+        SELECT id FROM partner_api_keys
+        WHERE partner_id = :partner_id AND is_active = TRUE
+        ORDER BY id DESC LIMIT 1
+        FOR UPDATE
+    """), {"partner_id": partner_id})
+    active_key = active_result.scalar_one_or_none()
+    if active_key is not None and not rotate:
+        raise ValueError("У вас уже есть активная пара ключей. Выберите перевыпуск, если Secret Key потерян.")
+
+    now = datetime.utcnow()
+    if rotate:
+        await session.execute(text("""
+            UPDATE partner_api_keys
+            SET is_active = FALSE, revoked_at = :now
+            WHERE partner_id = :partner_id AND is_active = TRUE
+        """), {"now": now, "partner_id": partner_id})
+
+    public_key = "bdaka_pub_" + secrets.token_urlsafe(24)
+    secret_key = "bdaka_sec_" + secrets.token_urlsafe(48)
+    secret_encrypted = encrypt_partner_secret(secret_key)
+    await session.execute(text("""
+        INSERT INTO partner_api_keys
+            (partner_id, token_hash, key_prefix, label, is_active, created_at, public_key, secret_encrypted)
+        VALUES
+            (:partner_id, :token_hash, :key_prefix, :label, TRUE, :created_at, :public_key, :secret_encrypted)
+    """), {
+        "partner_id": partner_id,
+        "token_hash": hashlib.sha256(public_key.encode("utf-8")).hexdigest(),
+        "key_prefix": public_key[:16],
+        "label": "Telegram bot",
+        "created_at": now,
+        "public_key": public_key,
+        "secret_encrypted": secret_encrypted,
+    })
+    await session.commit()
+    return public_key + "\n" + secret_key
+
+
+@router.callback_query(F.data.in_({"partner:create", "partner:rotate"}))
+async def partner_api_issue_token(callback: CallbackQuery, session):
+    rotate = callback.data == "partner:rotate"
+    await callback.answer()
+    try:
+        token = await _issue_partner_token(session, callback.from_user, rotate)
+    except ValueError as exc:
+        await session.rollback()
+        await callback.message.answer(str(exc))
+        return
+    except Exception:
+        await session.rollback()
+        log.exception("Could not issue partner API token for telegram_id=%s", callback.from_user.id)
+        await callback.message.answer("Не удалось выпустить ключи. Проверьте настройки шифрования и попробуйте позже.")
+        return
+
+    await callback.message.answer(
+        "🔐 <b>Ваша новая пара API-ключей</b>\n\n"
+        f"<b>Public Key</b> (идентификатор):\n<code>{token.splitlines()[0]}</code>\n\n"
+        f"<b>Secret Key</b> (секрет подписи):\n<code>{token.splitlines()[1]}</code>\n\n"
+        "<b>Сохраните оба ключа сейчас.</b> Secret Key повторно показать нельзя. "
+        "При перевыпуске предыдущая пара перестаёт работать.\n\n"
+        "Public Key передаётся в <code>X-API-Key</code>, Secret Key используется только для HMAC-SHA256 подписи. Никому не отправляйте Secret Key."
+    )

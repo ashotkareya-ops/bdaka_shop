@@ -100,7 +100,7 @@ async def process_platega_callback(data: dict, bot):
         await session.commit()
 
 
-async def fulfill_paid_order(order_id: int, bot):
+async def fulfill_paid_order(order_id: int, bot, send_telegram_delivery: bool = True):
     """Idempotently claim and fulfil a paid order. A claimed order is never auto-purchased twice."""
     async with SessionLocal() as session:
         order = await session.scalar(select(Order).where(Order.id == order_id).with_for_update())
@@ -125,7 +125,8 @@ async def fulfill_paid_order(order_id: int, bot):
             order.status = OrderStatus.COMPLETED.value
             user.purchase_count += 1
             await session.commit()
-            await send_order_delivery(bot, order.id)
+            if send_telegram_delivery:
+                await send_order_delivery(bot, order.id)
             await publish_purchase_notice(bot, order.id)
             return
 
@@ -134,14 +135,16 @@ async def fulfill_paid_order(order_id: int, bot):
             order.status = OrderStatus.PROCESSING.value
             await session.commit()
             await notify_admins(bot, f"⚠️ Заказ #{order.id}: запрошено {order.quantity} шт., локально найдено {len(keys)}. Требуется проверка остатка.")
-            await bot.send_message(user.telegram_id, f"Оплата заказа #{order.id} подтверждена. Проверяем наличие полного количества товара.")
+            if send_telegram_delivery:
+                await bot.send_message(user.telegram_id, f"Оплата заказа #{order.id} подтверждена. Проверяем наличие полного количества товара.")
             return
 
         if product.supplier_name != "sandromania" or not product.supplier_product_id:
             order.status = OrderStatus.PROCESSING.value
             await session.commit()
-            await bot.send_message(user.telegram_id,
-                f"Оплата заказа #{order.id} подтверждена. Товар временно недоступен, заказ передан на проверку.")
+            if send_telegram_delivery:
+                await bot.send_message(user.telegram_id,
+                    f"Оплата заказа #{order.id} подтверждена. Товар временно недоступен, заказ передан на проверку.")
             return
 
         # Claim before the external call. If the process crashes, reconcile this order manually;
@@ -161,8 +164,9 @@ async def fulfill_paid_order(order_id: int, bot):
             f"⚠️ Заказ #{order_id} оплачен, но закупка у поставщика не подтверждена "
             f"(ошибка/таймаут/нет баланса у поставщика). Проверьте заказ вручную, "
             f"повторно не покупайте и при необходимости сделайте возврат клиенту.")
-        await bot.send_message(telegram_id,
-            f"Оплата заказа #{order_id} подтверждена. Поставка обрабатывается; поддержка проверит результат.")
+        if send_telegram_delivery:
+            await bot.send_message(telegram_id,
+                f"Оплата заказа #{order_id} подтверждена. Поставка обрабатывается; поддержка проверит результат.")
         return
 
     async with SessionLocal() as session:
@@ -180,15 +184,17 @@ async def fulfill_paid_order(order_id: int, bot):
             if user:
                 user.purchase_count += 1
             await session.commit()
-            await send_order_delivery(bot, order_id)
+            if send_telegram_delivery:
+                await send_order_delivery(bot, order_id)
             await publish_purchase_notice(bot, order_id)
             await supplier_balance_watch(bot)
         else:
             await session.commit()
             await notify_admins(bot,
                 f"⏳ Заказ #{order_id} оплачен; поставщик принял заказ, но код ещё не выдан. Проверьте статус вручную.")
-            await bot.send_message(telegram_id,
-                f"Оплата заказа #{order_id} подтверждена. Поставщик обрабатывает заказ, код придёт отдельно.")
+            if send_telegram_delivery:
+                await bot.send_message(telegram_id,
+                    f"Оплата заказа #{order_id} подтверждена. Поставщик обрабатывает заказ, код придёт отдельно.")
 
 
 # ---------------------------------------------------------------------------
@@ -345,8 +351,8 @@ async def supplier_balance_watch(bot, force: bool = False):
     _last_balance_check = now
     try:
         balance = await SandromaniaClient().get_balance_rub()
-    except Exception:
-        log.warning("Could not read supplier balance")
+    except Exception as exc:
+        log.warning("Could not read Sandromania balance (%s): %s", type(exc).__name__, exc)
         return
     if balance < settings.supplier_low_balance_rub and (
         not _last_balance_alert or now - _last_balance_alert > 6 * 3600
