@@ -170,9 +170,11 @@ async def profile_home(callback: CallbackQuery, session):
 # Partner API access. Secret Key is shown once; only encrypted at rest.
 # ---------------------------------------------------------------------------
 
-def _partner_api_keyboard():
+def _partner_api_keyboard(api_docs_url: str | None = None):
     kb = InlineKeyboardBuilder()
-    kb.button(text="📚 Документация API", callback_data="partner:docs")
+    kb.button(text="📚 Инструкция по API", callback_data="partner:docs")
+    if api_docs_url:
+        kb.button(text="🌐 Открыть Swagger / проверить API", url=api_docs_url)
     kb.button(text="🔑 Получить API-ключи", callback_data="partner:keys")
     kb.button(text="↩️ Назад в профиль", callback_data="profile:home")
     kb.adjust(1)
@@ -195,7 +197,9 @@ def _partner_keys_keyboard(has_active_key: bool = False):
 async def partner_api_info(callback: CallbackQuery):
     await callback.answer()
 
-    api_url = settings.api_public_url.rstrip("/") if settings.api_public_url else None
+    # Use configured public URL when available; otherwise fall back to the active Amvera domain.
+    api_url = (settings.api_public_url or "https://bdaka-api-ashot111.msk1.amvera.tech").rstrip("/")
+    api_docs_url = f"{api_url}/docs"
 
     text = (
         "🤝 <b>ПАРТНЁРСКИЙ API BDAKA STORE</b>\n\n"
@@ -213,14 +217,16 @@ async def partner_api_info(callback: CallbackQuery):
         "Настройте их один раз — подпись запросов будет формироваться автоматически.\n\n"
     )
 
-    if api_url:
-        text += f"🌐 <b>Адрес API:</b>\n<code>{api_url}</code>\n\n"
+    text += (
+        f"🌐 <b>Адрес API:</b>\n<code>{api_url}</code>\n"
+        f"📖 <b>Swagger:</b> <a href=\"{api_docs_url}\">открыть документацию и проверку запросов</a>\n\n"
+    )
 
     text += "Выберите нужный раздел:"
 
     await callback.message.answer(
         text,
-        reply_markup=_partner_api_keyboard(),
+        reply_markup=_partner_api_keyboard(api_docs_url),
         parse_mode="HTML",
     )
 
@@ -255,13 +261,15 @@ async def partner_api_keys_menu(callback: CallbackQuery, session):
 async def partner_api_docs(callback: CallbackQuery):
     await callback.answer()
     kb = InlineKeyboardBuilder()
+    api_url = (settings.api_public_url or "https://bdaka-api-ashot111.msk1.amvera.tech").rstrip("/")
+    kb.button(text="🌐 Открыть Swagger / проверить API", url=f"{api_url}/docs")
     kb.button(text="↩️ Назад", callback_data="partner:api")
     kb.adjust(1)
     docs = (
         "📚 <b>ДОКУМЕНТАЦИЯ BDAKA STORE API</b>\n\n"
         "<b>Авторизация</b>\n"
         "Каждый запрос подписывается HMAC-SHA256. Партнёр получает пару ключей в этом боте.\n"
-        + (f"Базовый адрес: <code>{settings.api_public_url.rstrip('/')}</code>\n\n" if settings.api_public_url else "Базовый HTTPS-адрес API уточните у поддержки.\n\n")
+        + f"Базовый адрес: <code>{api_url}</code>\nSwagger: <code>{api_url}/docs</code>\n\n"
         + "Используется ваш обычный баланс BDAKA SHOP: пополнение и списание общие для покупок в боте и через API.\n"
         "• Public Key отправляется в заголовке <code>X-API-Key</code>.\n"
         "• Secret Key используется только локально для подписи и никогда не отправляется серверу.\n\n"
